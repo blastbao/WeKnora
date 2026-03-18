@@ -19,6 +19,112 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// knowledgeSearchTool 在知识库中查找与用户意图最相关的内容。
+// 它不依赖简单的关键词匹配，而是通过向量嵌入（Embedding）理解语义，并结合混合搜索、重排序（Rerank）和多样性优化（MMR）算法，确保返回结果既准确又丰富。
+
+// 1. 参数解析与查询目标确定
+//	输入解析：接收 JSON 参数，提取 queries 和可选的 knowledge_base_ids（指定搜索范围）。
+//	目标过滤：
+//		- 若指定了知识库 ID，则从指定知识库中搜索。
+//		- 若未指定，则使用所有配置的可搜索知识库。
+//		- 若无可用目标，直接返回错误。
+//	配置加载：从租户配置或全局配置中加载搜索参数（如 topK、向量阈值、关键词阈值），若无配置则使用默认值。
+//
+// 2. 并发混合搜索 (Concurrent Hybrid Search)
+//	并行执行：针对每个查询语句（Query）和每个搜索目标（Target），启动独立的 Goroutine 并发执行混合搜索（Hybrid Search）。
+//	混合机制：内部同时执行向量搜索（Vector Search）和关键词搜索（Keyword Search）。
+//	结果融合：使用 RRF (Reciprocal Rank Fusion) 算法将两路搜索结果合并，生成归一化的综合得分。
+//	元数据封装：将原始搜索结果封装，附加来源查询、匹配类型（hybrid）、知识库 ID 及类型等元数据。
+//
+// 3. 去重预处理
+//	多维去重：在重排序之前，先对原始结果进行去重。
+//	去重策略：基于 Chunk ID、父 Chunk ID、知识库+索引位置以及内容指纹（Content Signature）进行多重校验，保留得分最高的条目，减少后续计算开销。
+//
+// 4. 智能重排序 (Reranking)
+//	系统优先使用 LLM 进行重排序，若不可用则降级使用专用 Rerank 模型。
+//	 - FAQ 特殊处理：FAQ 类型的结果被视为精确匹配，保留原始高分，不参与重排序模型计算，直接并入最终列表。
+//	 - LLM 重排序 (首选)：
+//		- 分批处理：为避免 Token 超限，将结果每 15 条分为一批。
+//		- Prompt 评分：构造 Prompt 让 LLM 根据相关性（0.0-1.0）对每一批结果打分。
+//		- 解析与 fallback：解析 LLM 返回的分数，若解析失败或调用出错，则该批次回退到原始得分。
+//	 - 模型重排序 (备选)：若 LLM 不可用，调用专用的 Rerank 模型接口进行打分。
+//	 - 复合得分计算：在重排序得分基础上，结合原始得分、数据源权重（Web 搜索略降权）和位置优先因子（文档前部内容略加权），计算最终复合得分。
+//
+// 5. 多样性优化 (MMR)
+//	使用 MMR 算法，在保持高相关性的同时，剔除内容高度重复的条目，确保返回结果的多样性。
+//	参数：设定 Lambda=0.7，平衡相关性与多样性；选取前 topK 个结果。
+//
+// 6. 最终整理与输出格式化
+//	 - 二次去重与排序：对经过 MMR 处理的结果再次去重，并按最终得分降序排列。
+//	 - 内容增强：
+//		- 图片信息：若 Chunk 关联图片，解析并提取图片描述（Caption）和 OCR 文本，拼接到正文中。
+//		- FAQ 信息：若为 FAQ 类型，提取标准问题、相似问法及选项答案。
+//	 - 统计信息：计算每个文档的召回率（已召回 Chunk 数 / 总 Chunk 数），生成检索统计建议。
+//	 - 空结果处理：若未找到任何结果，返回明确的引导信息，提示模型不要编造答案，并根据配置建议使用联网搜索或直接告知用户未找到信息。
+//	 - 构建返回：生成包含人类可读文本（Output）和结构化数据（Data）的 ToolResult。
+
+// 执行示例
+//
+//	场景：用户询问“RAG 架构是如何工作的？”，系统配置了内部文档库和 FAQ 库。
+//	输入参数：
+//		{
+//		 	"queries": ["How does RAG architecture work?", "RAG workflow explanation"],
+//		 	"knowledge_base_ids": []
+//		}
+//
+//	执行过程：
+//		- 解析参数：提取出两个语义查询，确定搜索所有可用知识库。加载配置 topK=10, vector_threshold=0.6。
+//		- 并发搜索：
+//			- 启动多个 Goroutine，分别在“技术文档库”和“常见问题库”中执行混合搜索。
+//			- 底层返回 50 条原始匹配记录（包含向量和关键词匹配）。
+//	预处理：去除完全相同的 Chunk，剩余 35 条唯一记录。
+//	重排序：
+//		识别出 2 条 FAQ 记录（精确匹配），直接保留。
+//		将其余 33 条记录分 3 批发送给 LLM。
+//		LLM 返回新的相关性分数（例如某条原始得分低但语义极佳的记录被提权）。
+//		计算复合得分，融合 FAQ 记录。
+//	MMR 优化：
+//		发现前 5 条中有 3 条内容高度相似（都在讲定义）。
+//		MMR 算法剔除冗余，替换为一条讲“具体实施步骤”的记录，确保前 10 条结果覆盖定义、流程、优缺点等不同维度。
+//	格式化：
+//		提取每条结果中的图片描述（如有）。
+//		计算统计信息：“技术文档库”共 1000 个 Chunk，召回 8 个（0.8%）。
+//		组装最终文本。
+
+//	最终输出内容 (Output 片段)：
+//
+//	=== Search Results ===
+//	Found 10 relevant results
+//
+//	Knowledge Base Coverage:
+//	 - tech-docs-kb: 8 results
+//	 - faq-kb: 2 results
+//
+//	=== Detailed Results ===
+//
+//	[Source Document: RAG Architecture Guide]
+//
+//	Result #1:
+//	 [chunk_id: c_101][chunk_index: 5]
+//	Content: RAG (Retrieval-Augmented Generation) works by first retrieving relevant documents from a vector database based on the user query, then injecting these documents into the LLM's context window to ground the generation...
+//	 Related Images (1):
+//	   Image 1:
+//		 Caption: Diagram of RAG flow
+//		 OCR Text: Query -> Retriever -> Context -> LLM -> Answer
+//
+//	Result #2:
+//	 [chunk_id: f_05][chunk_index: 0]
+//	Content: Standard Question: How does RAG work?
+//	 FAQ Standard Question: How does RAG work?
+//	 FAQ Answers: It combines retrieval and generation...
+//
+//	=== 检索统计与建议 ===
+//
+//	文档: RAG Architecture Guide (tech-docs-kb)
+//	 总 Chunk 数: 1000
+//	 已召回: 8 个 (0.8%)
+//	 未召回: 992 个
+
 var knowledgeSearchTool = BaseTool{
 	name: ToolKnowledgeSearch,
 	description: `Semantic/vector search tool for retrieving knowledge by meaning, intent, and conceptual relevance.
@@ -1231,6 +1337,19 @@ type chunkRange struct {
 	start int
 	end   int
 }
+
+// getEnrichedPassage 将非结构化的图片信息（描述、OCR 文字）转化为纯文本，并与原文内容合并，
+// 从而让后续的文本处理流程（如分词、向量化、LLM 理解）能够“看见”并理解图片中的信息。
+//
+// 在传统的文本检索系统中，图片是“黑盒”，无法被检索。
+//	场景 1：检索图表数据
+//		用户问：“Q4 的销售额是多少？”
+//		如果只有正文，可能找不到答案（因为数据在图表里）。
+//		经过此函数处理后，OCR 提取的 "Q4: 200万" 变成了可检索的文本，系统能命中该片段。
+//	场景 2：理解流程图/架构图
+//		用户问：“登录流程的第一步是什么？”
+//		正文可能只说“见下图”，而图片的 Caption 或 OCR 包含了具体步骤。
+//		合并后，LLM 能根据提取的文本回答问题。
 
 // getEnrichedPassage 合并Content和ImageInfo的文本内容
 func (t *KnowledgeSearchTool) getEnrichedPassage(ctx context.Context, result *types.SearchResult) string {

@@ -22,6 +22,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
+// web_fetch 通常作为 web_search（联网搜索）的“增强补丁”，用于获取网页的完整内容并利用 AI 进行精炼总结。
+
 const (
 	webFetchTimeout  = 60 * time.Second // timeout for web fetch
 	webFetchMaxChars = 100000           // maximum number of characters to fetch
@@ -98,6 +100,11 @@ func NewWebFetchTool(chatModel chat.Chat) *WebFetchTool {
 }
 
 // Execute 执行 web_fetch 工具
+//
+// 网页抓取：
+//   - 接收一个列表 items，每项包含 {url, prompt}。
+//   - 使用 sync.WaitGroup 并行抓取所有 URL。
+//   - 在抓取前调用 normalizeGitHubURL 检测是否是 GitHub 文件链接(blob)，自动转换为原始文件链接，确保能直接下载到代码或文本，而不是 HTML 页面。
 func (t *WebFetchTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][WebFetch] Execute started")
 
@@ -306,6 +313,34 @@ func (t *WebFetchTool) validateAndResolve(p webFetchParams) (*validatedParams, e
 	}, nil
 }
 
+// 核心流程
+//  抓取 (Fetch)：调用 fetchHTMLContent。
+//		- 尝试用 Chromedp 或 HTTP 拿到网页原始 HTML。
+//		- 如果失败，立即通过 fmt.Sprintf 构造错误信息并返回，确保流程不中断。
+//  提纯 (Convert)：调用 convertHTMLToText。
+//		- 将抓到的 htmlContent（可能包含大量标签、脚本）转换为纯净的 Markdown/文本 (textContent)。
+//		- 为 LLM 提供高质量的输入，去除噪音，节省 Token。
+// 	总结 (Process)：调用 processWithLLM。
+//		- 把清洗后的文本送给 AI，根据用户的 Prompt 进行分析。
+// 	容错：
+//		- 如果 AI 总结失败（summaryErr != nil），不中断整个工具的运行，体现了“保底输出”的原则。
+// 	包装 (Build)：调用 buildOutputText，根据是否有 summary 决定展示“摘要”还是“原文预览”。
+//		- output: 给用户的最终文本（Markdown格式）。
+//		- resultData: 给系统的结构化数据（可能含 summary，也可能不含）。
+//		- summaryErr: 返回 LLM 的错误（如果有）。注意这里返回的是 summaryErr 而不是 nil，即使抓取成功了。这允许上层调用者知道“虽然拿到了内容，但总结失败了”，从而决定是否需要重试或提示用户。
+//
+// 在处理过程中，代码维护了一个 resultData（map[string]interface{}），它包含了这次任务的所有“结构化档案”：
+//	- url & prompt：原始任务信息。
+//	- raw_content：清洗后的网页全文（供后续可能的需求使用）。
+//	- content_length：抓取到的文本长度，可以帮助监控是否抓取到了空页面或异常大的页面。
+//	- method：标记是用了 chromedp 还是 http 抓取的，运维可以通过分析这个字段来优化策略（例如：如果发现 90% 的网站用 HTTP 就能搞定，可以减少 Chrome 的资源配额）。
+//	- summary：AI 生成的最终精华。
+//
+// 函数返回三个值：
+//	- string (output)：人类可读的文本，直接在聊天界面展示给用户。
+//	- map (resultData)：机器可读的结构体，包含 raw_content, method, content_length 等字段，供后续插件、日志系统或数据分析使用。
+//	- error：给代码逻辑看的，判断这次任务是否圆满成功。
+
 // executeFetch executes a web fetch item. displayURL is the URL shown to the user (e.g. original); vp.URL is the normalized URL we fetch.
 func (t *WebFetchTool) executeFetch(
 	ctx context.Context,
@@ -357,6 +392,14 @@ func (t *WebFetchTool) normalizeGitHubURL(source string) string {
 	}
 	return source
 }
+
+// processWithLLM 负责将抓取到的原始网页内容（Raw Content）与用户的特定问题（Prompt）结合，利用大语言模型（LLM）生成精准的摘要或答案。
+//
+// 1. 角色设定和行为准则
+// 2. 结构化输入：用户想要什么(params.Prompt)、“参考材料是什么” (content)
+// 3. 模型调用：
+//   - 低温度，降低模型的随机性和创造性；
+//   - 限制输出最大长度，防止模型啰嗦，节省 Token ，避免超时。
 
 // processWithLLM processes the content with an LLM
 func (t *WebFetchTool) processWithLLM(ctx context.Context, params webFetchParams, content string) (string, error) {
@@ -412,6 +455,14 @@ func (t *WebFetchTool) buildOutputText(params webFetchParams, content string, su
 	return builder.String()
 }
 
+// 首先尝试启动 无头浏览器 (Chrome)。
+// 现代网页（如 React, Vue 编写的单页应用）往往是“空壳”，内容是靠 JavaScript 动态生成的。
+// 只有浏览器引擎才能把这些脚本执行完，拿到最终看到的文字。
+//
+// 如果浏览器抓取失败，函数会调用底层的 HTTP 直接向服务器请求 HTML 源码。
+// 这种方法速度极快，消耗资源极低。但无法抓到那些靠 JS 动态加载的数据。
+// 但对于新闻、博客、代码等静态内容较多的网页，这种方法非常可靠。
+
 // fetchHTMLContent fetches the HTML content for a web fetch item using pinned IP (DNS pinning).
 func (t *WebFetchTool) fetchHTMLContent(ctx context.Context, vp *validatedParams) (string, string, error) {
 	html, err := t.fetchWithChromedp(ctx, vp)
@@ -433,6 +484,48 @@ func (t *WebFetchTool) fetchHTMLContent(ctx context.Context, vp *validatedParams
 
 	return html, "http", nil
 }
+
+// 使用无头浏览器（Chromedp）进行动态网页抓取。它不仅仅是简单的“打开网页”，其核心在于安全防御和对抗反爬。
+
+// 1. DNS Pinning（防 DNS 重绑定攻击）
+//
+// 背景: 之前的步骤已经解析过域名，确认了 vp.PinnedIP 是一个安全的公网 IP。
+// 问题:
+//	如果不做处理，Chrome 在发起网络请求时，会再次向 DNS 服务器查询该域名。
+//	黑客可以利用“DNS 重绑定”攻击，在这第二次查询时返回一个内网 IP（如 127.0.0.1），从而骗过浏览器访问内网。
+// 解决方案:
+//	MAP 域名 IP 是 Chrome 的底层网络规则语法。
+//	通过 host-resolver-rules 规则强制 Chrome：“当你看到域名 vp.Host 时，不要查 DNS，直接连接到 vp.PinnedIP”。
+//	彻底切断了 DNS 重绑定的可能性。无论外部 DNS 怎么变，浏览器只连我们验证过的那个 IP。
+
+// 2. 对抗反爬
+// 为了让抓取看起来更像“真人”而非“机器人”，代码配置了多个关键参数：
+// 	headless: true									无头模式。不在屏幕上显示窗口，节省服务器资源，适合后台运行。
+//	disable-setuid-sandbox: true					禁用沙箱权限检查。在 Docker 中运行 Chrome 通常需要此选项，否则会因为权限问题启动失败。
+//	disable-dev-shm-usage: true						防止内存崩溃。Docker 默认共享内存很小，Chrome 容易爆内存。此选项让 Chrome 使用 /tmp 代替，更稳定。
+//	disable-gpu: true								禁用 GPU	服务器通常没有显卡，禁用可避免初始化错误。
+//	disable-blink-features: AutomationControlled	移除 navigator.webdriver 特征。很多网站会检测这个特征来拦截机器人，移除它能提高抓取成功率。
+//	UserAgent: ... Chrome/120...					伪装成最新的 Windows Chrome 浏览器，避免被网站识别为 Linux 爬虫而拒绝服务。
+
+// 3. 性能与资源控制
+// 	资源节约：禁用了 GPU 硬件加速 (disable-gpu)、共享内存限制 (disable-dev-shm-usage) 和显示合成器 (VizDisplayCompositor)，这些配置让浏览器在服务器后台运行得更轻量。
+//	超时管理：如果网页加载太慢（比如超过 60 秒），程序会自动掐断，防止死锁导致服务器资源耗尽。
+
+// 4. 抓取动作
+//  代码执行了一个典型的浏览器指令序列：
+//	- Navigate：跳转到目标 URL。
+//	- WaitReady("body")：等待 HTML 文档的基础结构（DOM）加载完成，特别是对于那些需要加载一点脚本才能显示内容的网页。
+//	- OuterHTML：抓取整个 HTML 源码，包括由 JavaScript 动态生成后的内容。
+//
+// 其中：
+//	WaitReady 是关键，它不是傻等固定时间，而是等到 DOM 树中的 body 出现才继续。这对于抓取由 JavaScript 动态生成内容的网站（如 React/Vue 应用）至关重要。
+// 	OuterHTML("html") 会抓取包括 <html> 标签在内的完整源代码，包含所有动态插入的 DOM 节点。
+
+// 总结：
+//	安全性 (Security): 通过 host-resolver-rules 实现了应用层的 DNS 锁定，这是防御 SSRF 攻击的黄金标准。
+//	兼容性 (Compatibility): 专门针对 Docker 环境优化了内存和权限配置，保证在云原生环境下稳定运行。
+//	隐蔽性 (Stealth): 去除了自动化特征，伪装成普通用户，提高了对反爬网站的穿透力。
+//	动态支持 (Dynamic Content): 能够执行 JS 并等待渲染，解决了传统 HTTP 爬虫无法抓取“首屏后加载”内容的痛点。
 
 // fetchWithChromedp fetches the HTML content with Chromedp. Uses host-resolver-rules to pin host to vp.PinnedIP (DNS rebinding protection).
 func (t *WebFetchTool) fetchWithChromedp(ctx context.Context, vp *validatedParams) (string, error) {
@@ -465,9 +558,9 @@ func (t *WebFetchTool) fetchWithChromedp(ctx context.Context, vp *validatedParam
 
 	var html string
 	err := chromedp.Run(ctx,
-		chromedp.Navigate(vp.URL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.OuterHTML("html", &html),
+		chromedp.Navigate(vp.URL),                    // 1. 导航到 URL (受 DNS Pinning 保护)
+		chromedp.WaitReady("body", chromedp.ByQuery), // 2. 等待 <body> 标签就绪 (确保页面已初步渲染)
+		chromedp.OuterHTML("html", &html),            // 3. 获取整个 <html> 标签的内容
 	)
 	if err != nil {
 		return "", fmt.Errorf("chromedp run failed: %w", err)
@@ -523,6 +616,37 @@ func (t *WebFetchTool) fetchWithTimeout(ctx context.Context, vp *validatedParams
 	return t.client.Do(req)
 }
 
+// 将杂乱无章、充满标签的 HTML 源码，转换为干净、结构化且适合 LLM 阅读的 Markdown 文本。
+// 如果不做这个处理，直接把 HTML 发给 AI，会面临两个问题：
+//	- Token 浪费：一个普通网页 HTML 可能有 10 万字符，其中 90% 都是标签和 JS 脚本。
+//	- 注意力分散：AI 可能会被 CSS 样式名或复杂的 DOM 结构干扰，找不到正文。
+//
+//
+// 数据解析：
+// 	主路径: 使用 goquery (基于 jQuery 语法的 HTML 解析库) 将 HTML 字符串解析为 DOM 树。这使得后续可以使用类似 CSS 选择器的语法精准操作节点。
+// 	兜底策略: 如果 HTML 严重损坏导致 goquery 解析失败，不直接报错，而是降级调用 t.basicTextExtraction(html)（通常是用正则简单提取可见文本）。
+// 	总结: 这保证了即使网页代码不规范，工具也能尽可能提取出内容，而不是直接崩溃。
+//
+// 噪音清洗：
+//	通过 doc.Find("").Remove() 直接删除网页中对 AI 毫无用处的部分：
+//	- script, style：代码和样式（AI 不需要看这些）。
+//	- nav, footer, header：导航栏、页脚、页眉。
+//	这些内容在每个网页都一样，而且充满了无关链接，删掉它们能节省大量 Token 空间。
+//
+// 递归式 Markdown 转换:
+//	从 <body> 标签开始，通过 processNode 函数递归地遍历每一个子节点，执行转换：
+//		<h1> -> #
+//		<p> -> 段落 + 换行
+//		<ul>/<li> -> -
+//		<a> -> [text](url)
+//		<table> -> Markdown 表格
+// 	LLM 在 Markdown 格式上的训练数据最多，理解能力最强，更容易识别哪些是标题，哪些是重点。
+// 	将 HTML 转为 Markdown 能显著提升总结的准确性。
+//
+// 后处理与格式化
+//	在转换过程中，可能会因为嵌套标签产生连续多个换行符（如 \n\n\n\n）。正则表达式将其统一压缩为标准的 双换行 (\n\n)，这是 Markdown 中段落的標準分隔符。
+//  用 strings.TrimSpace 确保输出没有多余的开头/结尾空行，保持整洁。
+
 // convertHTMLToText converts the HTML content to text
 func (t *WebFetchTool) convertHTMLToText(html string) string {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
@@ -541,6 +665,14 @@ func (t *WebFetchTool) convertHTMLToText(html string) string {
 	result = regexp.MustCompile(`\n{3,}`).ReplaceAllString(result, "\n\n")
 	return strings.TrimSpace(result)
 }
+
+// processNode 通过递归遍历 HTML DOM 树，将各种 HTML 标签精准地“翻译”成对应的 Markdown 语法，是实现“从网页到 LLM 可读文本”转换的核心引擎。
+// 它没有使用现成的库（如 html2text），而是手写了一套定制化的转换逻辑，这通常是为了获得更精细的控制（例如处理代码块、表格格式或特定的清洗规则）。
+
+// 为什么 Markdown 对 AI 更友好？
+// 	语义增强：AI 对 Markdown 的理解远强于对 HTML 的理解。加粗（**）和标题（#）能显著提高 AI 提取重点的准确率。
+//	数据极简：剔除了 HTML 标签中的所有属性（如 class, style, id 等），这些对阅读毫无意义的字符占用了大量的 Token 空间。
+//	格式对齐：通过将不同风格的网页统一转换成一种 Markdown 格式，你的 processWithLLM 函数（那个调用 AI 总结的步骤）就可以使用统一的 Prompt，不需要为每个网站单独写逻辑。
 
 // processNode processes a node in the HTML content
 func (t *WebFetchTool) processNode(s *goquery.Selection, markdown *strings.Builder) {

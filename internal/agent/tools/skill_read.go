@@ -12,6 +12,14 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
+// 在一个复杂的 Agent 系统中，我们不能把所有的 skill 说明（可能成千上万行）一次性塞进 LLM 的 Prompt 里，否则会造成：
+//	- Token 浪费：上下文窗口会瞬间爆满。
+//	- 干扰严重：无关的指令会降低 AI 遵循核心任务的能力。
+
+// 所以，在 System Prompt 上下文有限的情况下，系统提示词通常只包含 skill 的“简介”，
+// 具体的执行步骤、参数要求、注意事项等详细内容存储在独立的 skill 目录中（通常是 SKILL.md）。
+// Agent 需要执行具体 skill 时，调用这个工具来获取该 skill 的完整信息。
+
 // Tool name constant for read_skill
 
 var readSkillTool = BaseTool{
@@ -30,8 +38,8 @@ var readSkillTool = BaseTool{
 
 ## Returns
 - Skill instructions and guidance for completing the task
-- File content if file_path is specified`,
-	schema: utils.GenerateSchema[ReadSkillInput](),
+- File content if file_path is specified`, // 告诉 LLM 什么时候用这个工具
+	schema: utils.GenerateSchema[ReadSkillInput](), // 定义输入参数的 JSON Schema
 }
 
 // ReadSkillInput defines the input parameters for the read_skill tool
@@ -53,6 +61,22 @@ func NewReadSkillTool(skillManager *skills.Manager) *ReadSkillTool {
 		skillManager: skillManager,
 	}
 }
+
+// 当 AI 想知道某个技能具体怎么用时，这段代码负责去文件夹里把“说明书”读出来，
+// 顺便告诉 AI 这个技能文件夹里还有哪些“辅助文件”，最后整理成一段通顺的文字发给 AI。
+//
+// 输入：技能名字（比如 "data_cleaner"）。
+// 处理：读文件 -> 列目录 -> 拼文字。
+// 输出：一段包含 “怎么做” 和 “有哪些文件” 的 Markdown 文本。
+
+// 内部包含两个分支：
+//	第一段 (if)：是“精读”。用户指定了具体文件名，只读那一个文件的内容（比如只看某个脚本代码）。
+//	第二段 (else)：是“概览”。用户没指定文件，默认读取技能的主说明书，并顺便列出目录下还有哪些其他文件。
+//
+// AI 总是先走 else 分支，获取“操作指南”和“文件列表”。
+// AI 看到列表后，如果发现有用的附件，它才会走 if 分支，去读取“文件内容”。
+// 这样，不需要一次性把所有东西塞给 AI，而是让 AI 先看大纲，觉得有需要再自己去翻细节。
+// 这样，既节省了 Token，又让 AI 的逻辑更清晰。
 
 // Execute executes the read_skill tool
 func (t *ReadSkillTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
@@ -107,6 +131,11 @@ func (t *ReadSkillTool) Execute(ctx context.Context, args json.RawMessage) (*typ
 		resultData["content_length"] = len(content)
 
 	} else {
+		// 主要工作：
+		//  读取说明书：获取 skill 的元数据，包含名称、简介和操作指令。
+		//  列出相关文件：扫描 skill 文件夹，看看除了说明书 (SKILL.md) 外，还有没有脚本 (.py, .sh)、配置文件 (.yaml) 或其他文档。
+		//  拼接成给 AI 看的文本：技能概况、操作指南、附件清单
+
 		// Read the main skill instructions (SKILL.md)
 		skill, err := t.skillManager.LoadSkill(ctx, input.SkillName)
 		if err != nil {

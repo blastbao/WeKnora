@@ -107,6 +107,39 @@ func NewWebSearchTool(
 	}
 }
 
+// 1. 输入解析与校验：解析 query ，如果为空，直接报错。
+// 2. 租户识别：从上下文 (ctx) 中获取 TenantID ，确保权限受控。
+// 3. 检查该租户是否开启了 Web Search 功能（即配置了 Provider，如 Google, Bing, Tavily 等）。如果未配置，直接拒绝服务。
+// 4. 执行网络搜索：通过 webSearchService.Search 向配置好的搜索引擎发起 HTTP 请求。
+// 5. RAG 压缩与状态持久化
+//  - 状态恢复：从 Redis 读取当前会话的“临时知识库 ID”和“已处理文档列表”。这意味着如果在同一会话中再次搜索相似内容，系统可以识别并去重。
+//  - RAG 压缩：调用 CompressWithRAG ，这通常利用一个小模型或提取算法，从搜索结果中提炼出直接回答问题的内容，去除广告、导航栏等噪音。
+//  - 状态持久化：将新生成的压缩内容索引到一个临时的知识库中，并更新 Redis 中的状态。这使得后续的对话可以引用这次搜索的结果，而无需重新搜索。
+// 6. 结果格式化封装
+//  - 数据截断：为了防止网页正文过长导致 AI 上下文溢出，函数对 Content 进行了强制截断，并加上省略号。
+//  - 结构化输出：同时返回给前端 Data（用于 UI 渲染表格/卡片）和 Output（给 AI 阅读的文本）。
+//  - Next Steps 引导：在返回给 AI 的文本末尾明确写道：“内容已截断，如需详情请使用 web_fetch”，引导 AI 针对特定的高价值 URL 发起深度抓取请求。
+
+// 设计优势
+//  - 成本与效率优化: 通过 RAG 压缩，大幅减少了传递给 LLM 的 Token 数量，降低了成本，同时提高了回答的精准度（去除了噪音）。
+//  - 会话记忆: 利用 Redis 存储会话状态，实现了跨轮次的搜索记忆和去重，让 Agent 显得更“聪明”。
+//  - 鲁棒性: 具备完善的降级机制（压缩失败用原数据）和参数校验，确保在各种异常情况下都能给出明确的反馈。
+//  - 引导性: 输出中内置的 Next Steps 指导，有效地管理了 LLM 的预期和行为，促使其在需要时自动调用 web_fetch。
+//  - 多租户安全: 严格的租户配置检查，确保了资源使用的隔离性和可控性。
+
+// 函数概览：
+//
+//	输入：一堆网页链接 + 用户的问题。
+//	内部动作：
+//	  - 爬取网页正文。
+//	  - 切成小块。
+//	  - 计算相关性（留下有用的，删掉没用的）。
+//	  - 存入临时知识库。
+//	输出（即左边的返回值）：
+//	  - compressed: 提纯后的文字段落。
+//	  - kbID: 存放这些段落的临时仓库地址。
+//	  - newSeen/newIDs: 更新后的“已阅”清单，传回给外层下次使用。
+
 // Execute executes the web search tool
 func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][WebSearch] Execute started")
@@ -181,18 +214,46 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*typ
 	logger.Infof(ctx, "[Tool][WebSearch] Web search returned %d results", len(webResults))
 
 	// Apply RAG compression if configured
+	//
+	// 如果有搜索结果，且租户配置中开启了压缩功能，就执行 Dag 压缩。
 	if len(webResults) > 0 && tenant.WebSearchConfig.CompressionMethod != "none" &&
 		tenant.WebSearchConfig.CompressionMethod != "" {
+
 		// Load session-scoped temp KB state from Redis using WebSearchStateRepository
+		//
+		// 通过 sessionID 从 Redis 中取回该用户当前的回话状态。
+		//
+		// 返回值含义:
+		//	- tempKBID: 当前会话专用的“临时知识库”ID。如果这是该会话第一次搜索，可能为空或需要新建。
+		//	- seen: 一个集合，记录了已经处理过的 URL 或文档 ID。用于去重。
+		//	- ids: 已存入临时知识库的文档 ID 列表。
+		//
+		// 如果用户在同一个会话中搜索了两次相似的内容，系统可以识别出哪些结果是新的，哪些是旧的，避免重复处理和重复索引。
 		tempKBID, seen, ids := t.webSearchStateService.GetWebSearchTempKBState(ctx, t.sessionID)
 
 		// Build questions for RAG compression
+		//
+		// 先把用户的搜索词（query）作为一个“问题”，后续 Rag 压缩程序会根据这些问题去网页里“划重点”。
+		//
+		// Rag 压缩程序：
+		//	先把搜索到的几个网页内容全部抓下来，切成一小块一小块的文字（Chunks）；
+		//	对比这些小块文字和你的“问题清单”，只留下那些真正能回答问题的段落。
+		//	把这些有用的段落存进一个临时知识库（tempKBID）。
+
 		questions := []string{strings.TrimSpace(query)}
 
 		logger.Infof(ctx, "[Tool][WebSearch] Applying RAG compression")
 		compressed, kbID, newSeen, newIDs, err := t.webSearchService.CompressWithRAG(
-			ctx, t.sessionID, tempKBID, questions, webResults, tenant.WebSearchConfig,
-			t.knowledgeBaseService, t.knowledgeService, seen, ids,
+			ctx,
+			t.sessionID,            // 会话 ID ，系统会根据这个 ID 在内存或 Redis 里建立一个临时的小仓库，专门放这次搜到的内容。
+			tempKBID,               // 临时知识库的 ID ，如果这是该会话的第二次搜索，它会把新搜到的内容追加到之前已经创建好的那个小仓库里。
+			questions,              // 用户的问题列表，RAG 压缩时会根据这些问题，去计算网页中哪些段落与问题最相关，不相关的废话（广告、页脚）会被直接扔掉。
+			webResults,             // 搜索引擎刚刚给出的原始结果列表（包含 URL 和初步摘要），系统会顺着这些 URL 去抓取更详细的正文内容。
+			tenant.WebSearchConfig, // 租户的搜索配置，包含：压缩算法，最大长度...
+			t.knowledgeBaseService, // 数据库操作
+			t.knowledgeService,     // 数据库操作
+			seen,                   // 已经抓取过的 URL 集合，
+			ids,                    // 已经处理过的 数据分片（Chunk）ID
 		)
 		if err != nil {
 			logger.Warnf(ctx, "[Tool][WebSearch] RAG compression failed, using raw results: %v", err)

@@ -12,7 +12,69 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
+// 该工具允许 Agent 调用某个 Skill 目录下附带的脚本（如 Python、Shell 脚本等）。
+
+// 这个工具的主要作用是在安全的沙箱环境中运行脚本。
+//	- 输入：技能名称、脚本路径、命令行参数以及可选的标准输入数据。
+//	- 处理：验证输入，检查权限，然后调用底层的 skills.Manager 来执行脚本。
+//	- 输出：返回结构化的执行结果，包括标准输出（stdout）、标准错误（stderr）、退出码、执行时长以及是否被强制终止等信息。
+
 // Tool name constant for execute_skill_script
+//
+// 工具定义，告诉 LLM（大语言模型）什么时候该用这个工具：
+//	- 场景：当模型发现技能说明书中提到 “运行某某分析脚本” 时使用。
+//	- 确定性：强调对于复杂的逻辑处理，运行脚本比模型直接生成代码更可靠。
+//	- 安全性：明确告知模型这些脚本运行在隔离的沙箱中，没有网络权限，且只能访问该技能自己的文件夹。
+//
+// 输入参数结构 (ExecuteSkillScriptInput)
+//	- SkillName: 必填，指定哪个技能。
+//	- ScriptPath: 必填，脚本的相对路径。
+//	- Args: 选填，命令行参数（如 --mode fast）。
+//	- Input: 选填，通过标准输入 (stdin) 传递的数据，方便将内存中的 JSON 或大量文本直接“喂”给脚本。
+//
+// 执行逻辑 (Execute 函数)
+//	- 参数解析与校验：检查 JSON 参数是否合法，确保 SkillName 和 ScriptPath 不为空。
+//	- 状态检查：确认 skillManager 是否已启用。
+//	- 核心调用：调用 skillManager.ExecuteScript。这会触发底层沙箱（Sandbox）启动环境、加载文件并运行。
+//	- 结果格式化：将脚本运行的结果（输出、错误、耗时等）组装成一个易于阅读的 Markdown 字符串返回给模型。
+//
+// 设计细节
+//	- 结果可视化：代码使用了 strings.Builder 来构建非常详细的报告，包括 === Script Execution === 标题和代码块包裹的输出。这有助于 LLM 理解脚本到底运行了什么，以及为什么失败。
+//	- 安全性检查：在执行前，工具会打印日志记录执行详情，并通过 skillManager 确保脚本路径合法（防止路径穿越攻击）。
+//	- 结构化数据返回：除了给模型看的 Output（Markdown 字符串），还返回了 Data（Map 结构）。这对于系统后台监控或后续自动化处理非常有用。
+
+// AI 发送给工具的 JSON 数据：
+//
+//	{
+//		"skill_name": "data_analyzer",
+//		"script_path": "scripts/process_logs.py",
+//		"args": ["--format", "json", "--verbose"],
+//		"input": "{\"logs\": [\"error: connection timeout\", \"info: retrying...\"], \"threshold\": 5}"
+//	}
+//
+// Output 字段
+//
+//	=== Script Execution: data_analyzer/scripts/process_logs.py ===
+//
+//	**Arguments**: [--format json --verbose]
+//	**Exit Code**: 0
+//	**Duration**: 1.24s
+//
+//	## Standard Output
+//
+//	```json
+//	{
+//	  "status": "completed",
+//	  "processed_count": 2,
+//	  "alerts": [
+//		{
+//		  "level": "warning",
+//		  "message": "Connection timeout detected",
+//		  "action": "retry_scheduled"
+//		}
+//	  ],
+//	  "summary": "Log processing finished successfully."
+//	}
 
 var executeSkillScriptTool = BaseTool{
 	name: ToolExecuteSkillScript,

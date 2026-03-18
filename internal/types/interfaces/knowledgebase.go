@@ -11,6 +11,19 @@ import (
 	"github.com/hibiken/asynq"
 )
 
+// 混合搜索流程 (HybridSearch)
+//
+//	当调用此接口时，后端通常会执行以下操作：
+//		- 将用户的提问（Query）通过 Embedding 模型转化为向量。
+//		- 在向量数据库（如 Milvus, Pinecone）中检索相似分片。
+//		- 在全文搜索引擎（如 Elasticsearch）中检索关键词匹配。
+//		- 对两者的结果进行 Rerank（重排序），最后返回给用户。
+
+// KnowledgeBaseService:
+//	职责: 处理复杂的业务逻辑、权限验证、事务控制、跨租户隔离、异步任务调度以及对外暴露的高层 API。
+// KnowledgeBaseRepository:
+//	职责: 负责与底层数据存储进行直接交互。只负责 CRUD（增删改查）操作，不包含复杂的业务规则。
+
 // KnowledgeBaseService defines the knowledge base service interface
 // Provides high-level operations for knowledge base creation, querying, updating, deletion, and content searching
 type KnowledgeBaseService interface {

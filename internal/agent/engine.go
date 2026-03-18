@@ -18,10 +18,39 @@ import (
 	"github.com/google/uuid"
 )
 
-// generateEventID generates a unique event ID with type suffix for better traceability
-func generateEventID(suffix string) string {
-	return fmt.Sprintf("%s-%s", uuid.New().String()[:8], suffix)
-}
+// AgentEngine 是 ReAct (Reasoning and Acting) 代理的核心驱动引擎。
+// 它通过迭代循环协调大模型 (LLM) 与工具集 (Tools) 的交互。
+//
+// 1. 核心架构：ReAct 循环 (executeLoop)
+//    引擎在 MaxIterations 限制内运行迭代逻辑，每轮包含以下标准动作：
+//    - Think (思考): 通过 streamThinkingToEventBus 调用 LLM。AI 基于当前上下文决定是否调用工具。
+//      该步骤支持流式输出 (Streaming)，允许用户实时观察 AI 的推理过程。
+//    - Act (行动): 若 AI 触发 Function Call，引擎解析参数并通过 toolRegistry 调度具体工具执行
+//      (如 GrepChunks, DataSchemaTool 等)。
+//    - Observe (观察): 将工具执行结果 (ToolResult) 作为 Observation 反馈给 AI，构筑下一轮推理的基础。
+//
+// 2. 状态机与上下文管理 (AgentState & ContextManager)
+//    - AgentState: 实时记录执行全过程，包括每一轮的思维链 (Thought) 和工具调用详情 (ToolCalls)。
+//    - ContextManager: 负责将 AI 的思考过程、工具调用参数及执行结果持久化至数据库。
+//      这确保了对话的连续性，支持在会话中断后能够恢复完整的推理上下文。
+//
+// 3. 事件驱动机制 (EventBus)
+//    采用高度解耦的设计，通过 EventBus 实时向前端推送执行状态：
+//    - EventAgentThought: 推送 AI 的实时推理流片段。
+//    - EventAgentToolCall: 标记工具调用开始（如“正在检索知识库...”）。
+//    - EventAgentToolResult: 传输工具执行后的结构化数据 (Data)，用于前端组件化渲染。
+//    这种机制确保了 UI 层的生动反馈，使用户能够感知 AI 复杂的后台决策链路。
+
+// AgentEngine 是执行 ReAct (Reasoning + Acting) 模式的核心智能体引擎。
+// 它通过依赖注入整合了以下关键组件以构建完整的智能体运行时环境：
+// - config: 控制最大迭代次数、温度及反思策略等行为参数。
+// - chatModel: LLM 推理接口，负责生成思考链与工具调用决策。
+// - toolRegistry: 工具注册中心，负责解析并执行具体的外部动作。
+// - skillsManager: (可选) 实现技能渐进式披露，动态优化 Prompt 中的技能元数据。
+// - knowledgeBasesInfo & selectedDocs: 注入知识库元数据与用户选定文档，构建 RAG 上下文。
+// - contextManager: 负责多轮对话历史的状态管理与持久化存储。
+// - eventBus: 事件总线，实时广播思考过程、工具执行状态及最终结果，实现前后端解耦。
+// - sessionID & systemPromptTemplate: 标识会话上下文并支持自定义系统提示词模板。
 
 // AgentEngine is the core engine for running ReAct agents
 type AgentEngine struct {
@@ -208,6 +237,42 @@ func (e *AgentEngine) Execute(
 	})
 	return state, nil
 }
+
+// 核心流程
+//
+//	函数 executeLoop 采用了一个 for 循环，直到达到最大迭代次数（MaxIterations）或 LLM 给出最终答复。
+//	每一轮（Round）迭代遵循以下四个阶段：
+//	 - 思考 (Think)：调用 LLM，获取下一步动作（文本思考或工具调用）。
+//	 - 判断 (Check)：分析 LLM 的停止原因。如果没有工具调用且模型指示停止，则结束循环。
+//	 - 行动 (Act)：遍历 LLM 要求的工具调用，通过 toolRegistry 执行具体逻辑。
+//	 - 观察与反馈 (Observe)：将工具执行结果格式化，反馈给 LLM 进入下一轮。
+
+// executeLoop 执行 ReAct (Reasoning + Acting) 核心循环，驱动智能体完成“思考 - 行动 - 观察”的迭代过程。
+// 该函数通过事件总线 (EventBus) 实时流式推送思考内容、工具调用状态及最终结果，实现前后端解耦与高交互体验。
+//
+// 主要执行流程：
+// 1. 循环控制：基于 MaxIterations 防止死循环，每轮记录上下文状态与埋点信息。
+// 2. Think (思考)：调用 LLM 生成推理链与工具调用决策，流式输出思考过程；若 LLM 调用失败则立即终止。
+// 3. Check (终止判断)：若 LLM 返回 "stop" 且无工具调用，视为任务完成，设置最终答案并跳出循环。
+// 4. Act (行动)：串行执行所有工具调用。
+//    - 具容错机制：工具执行错误不中断流程，而是封装为 Observation 供 LLM 自我修正 (Self-Correction)。
+//    - 实时反馈：发射工具调用开始、结果及结构化数据事件，支持前端富文本渲染。
+//    - 可选反思：若启用 Reflection，在每次工具执行后邀请 LLM 评估结果有效性。
+// 5. Observe (观察)：将本轮的思考、工具请求及执行结果按标准格式追加至消息历史，并持久化到 ContextManager。
+// 6. 兜底策略：若达到最大迭代次数仍未完成，强制调用 LLM 基于已有工具结果合成最终答案，确保用户体验闭环。
+// 7. 收尾：发射包含完整执行轨迹 (AgentSteps)、知识引用及耗时统计的完成事件 (EventAgentComplete)。
+//
+// 参数说明:
+// - ctx: 上下文，用于控制超时与链路追踪。
+// - state: 智能体运行时状态，记录步骤、答案及完成标志。
+// - query: 用户原始查询。
+// - messages: 当前对话历史消息列表 (含 System Prompt)。
+// - tools: 当前可用的工具定义列表，用于 LLM Function Calling。
+// - sessionID/messageID: 会话与消息唯一标识，用于事件关联与上下文持久化。
+//
+// 返回:
+// - *types.AgentState: 执行结束后的完整状态（含最终答案与执行轨迹）。
+// - error: 若发生不可恢复错误（如 LLM 服务不可用）则返回错误，工具级错误由内部消化处理。
 
 // executeLoop executes the main ReAct loop
 // All events are emitted through EventBus with the given sessionID
@@ -639,6 +704,46 @@ func (e *AgentEngine) appendToolResults(
 	return messages
 }
 
+// streamLLMToEventBus 驱动 LLM 的流式交互过程，实现“边推理、边分发、边汇总”的全链路处理。
+//
+// 该函数作为 Agent 引擎的通用底层驱动，负责建立与模型的长连接，通过增量迭代方式持续监听数据流，
+// 并在实时回调中完成事件分发，最终归纳为静态结果返回。
+//
+// 详细执行阶段:
+//  1. 建立连接 (Handshake):
+//     调用 ChatStream 启动与 LLM 的长连接。
+//     若因模型负载过高或网络异常导致启动失败，将立即捕获错误并返回，防止 Agent 进入无效的等待循环。
+//
+//  2. 增量迭代 (Incremental Iteration):
+//     通过 range stream 持续监听模型泵出的数据块 (Chunks)，执行双重累积：
+//     - 文本累加 (Thought Accumulation):
+//    	 实时拼接 chunk.Content 至 fullContent，解决字符碎片化问题，确保最终拥有完整的推理文本以存入上下文历史。
+//     - 工具意图捕获 (Tool Call Capture):
+//    	 动态更新 chunk.ToolCalls。
+//   	 鉴于流式协议中工具指令（ID、名称、参数）是分段发送的，此步骤确保在流结束时能捕获到最新且完整的工具指令集合。
+//
+//  3. 实时响应回调 (Real-time Feedback Loop):
+//     每接收一个有效 Chunk，立即触发 emitFunc 回调，实现低延迟交互：
+//     - 思考流分发: 让前端能像 ChatGPT 一样逐字渲染 Agent 的“心路历程”。
+//     - 工具调用预警:
+//       允许上层在工具参数完全传完前，提前向 EventBus 发送“准备中”状态信号，提升用户的交互即时感。
+//
+//  4. 状态归纳 (State Resolution):
+//     当 stream 通道关闭，完成从“动态流”到“静态对象”的转换。
+//     返回汇总后的 fullContent 和 toolCalls，供后续环节进行精准的 JSON 解析与工具执行。
+//
+// 参数说明:
+//   - ctx: 上下文，用于控制请求取消、超时及链路追踪。
+//   - messages: 发送给 LLM 的完整对话历史消息列表。
+//   - opts: 聊天配置选项，包含温度 (temperature)、TopP 及可用工具定义等。
+//   - emitFunc: 核心回调函数。每收到一个数据块即被调用，接收当前原始块 (chunk)
+//     和截止到当前的完整累积内容 (fullContent)，由调用者决定具体的分发逻辑。
+//
+// 返回值:
+//   - string: 整个流过程中累计生成的完整文本字符串 (fullContent)。
+//   - []types.LLMToolCall: 模型在本轮迭代中生成的最终工具调用指令列表。
+//   - error: 流读取过程中的连接中断、超时或模型解析错误。
+
 // streamLLMToEventBus streams LLM response through EventBus (generic method)
 // emitFunc: callback to emit each chunk event
 // Returns: full accumulated content, tool calls (if any), error
@@ -681,6 +786,75 @@ func (e *AgentEngine) streamLLMToEventBus(
 	return fullContent, toolCalls, nil
 }
 
+// streamReflectionToEventBus 执行 Agent 的“自省”逻辑，评估工具执行结果的有效性，
+// streamReflectionToEventBus 是连接工具执行结果与下一轮智能决策之间的桥梁。
+//
+// 详细处理流程：
+// 1. 场景还原：根据工具名和执行结果构建反思 Prompt，引导模型进入“结果审计”模式。
+// 2. 异步流转：复用 streamLLMToEventBus 开启流式会话，将自省过程透明化。
+// 3. 实时播报：通过 EventBus 广播 EventAgentReflection 事件，允许 UI 实时展示 Agent
+//    对当前进度的自我评估（如：确认结果是否满足需求，规划下一阶段行动）。
+// 4. 结果持久化：汇总完整的反思文本并返回，供 executeLoop 存入 AgentStep 以备后续回溯。
+//
+// 参数说明：
+//   - toolCallID: 关联的工具调用标识，用于 UI 定位反思发生的上下文。
+//   - result: 工具执行后的原始输出内容，作为反思的基础素材。
+
+// 反思过程和主流程，是如何融合的？
+//
+// 	// --- executeLoop 主循环内部 ---
+//	//
+//	// 1. Think: LLM 决定调用工具 (streamThinkingToEventBus)
+//	// 2. Act: 遍历执行工具 (e.toolRegistry.ExecuteTool)
+//	for _, tc := range response.ToolCalls {
+//    	result, err := e.toolRegistry.ExecuteTool(...)
+//
+//    	// 【融合点】：工具刚执行完，拿到 result 之后立即触发
+//    	if e.config.ReflectionEnabled && result != nil {
+//        	// 调用反思函数
+//        	reflection, _ := e.streamReflectionToEventBus(ctx, tc.ID, tc.Name, result.Output, ...)
+//        	// 将反思结果挂载到当前步骤中，作为下一轮 Think 的重要参考
+//        	step.ToolCalls[lastIdx].Reflection = reflection
+//    	}
+//	}
+//
+//	// 3. Observe: 将「工具结果 + 反思内容」一起喂给下一轮 LLM
+//	// 4. 下一轮循环开始...
+//
+// 反思并不是孤立的，它的输出会改变 Agent 的“记忆”：
+//	- 输入融合：本函数将「工具名 + 执行结果」组合成一段特定的 Prompt，强制模型进入“审计模式”。
+//	- 输出融合：
+//		反思产生的 fullReflection 文本会被存入 AgentStep 。
+//		在下一轮 executeLoop 开始时，e.appendToolResults 会把这个反思建议连同工具原始数据一起传给 LLM。
+//
+//		示例：
+//			LLM 下一轮看到的不仅仅是“搜索结果为空”，可能还有反思结论 ——
+//			“搜索关键词太长了，我应该尝试缩短关键词重试”。
+//
+//
+// 在用户界面上，这种融合表现为「事件链」：
+//	- 事件 A (EventAgentToolCall): UI 显示“正在查询天气...”。
+//	- 事件 B (EventAgentToolResult): UI 显示“查询成功，气温 25度”。
+//	- 事件 C (EventAgentReflection): UI 在下方立即跳出动态文本——“Agent 反思：数据已获取，但缺少风力信息，我决定再补调一个接口。”
+
+// [ 主流程 executeLoop ]
+//       │
+//       ├─> [ 第一次调用 streamLLMToEventBus ] ────> 目的：决策（Think）
+//       │
+//       └─> (工具执行完毕后)
+//             │
+//             └─> [ streamReflectionToEventBus ]
+//                       │
+//                       └─> [ 第二次调用 streamLLMToEventBus ] ──> 目的：反思（Reflection）
+//
+// 虽然都是流式调用 LLM，但这两次调用的上下文（Context）完全不同：
+//	- 主流程调用：传入的是整个对话历史，目的是让模型决定“下一步调哪个工具”。
+//	- 反思流程调用：传入的是一个专门构造的 reflectionPrompt（只包含刚才的工具结果），目的是让模型扮演“质检员”，专门评估刚才那一步做得对不对。
+//
+// 在当前的 Go 代码实现中，主流程和反思流程并不是“共用”同一个物理长连接，而是“复用”了同一种连接构建模式。
+// 由于 LLM 的 API（如 OpenAI 或 Anthropic 风格的接口）通常是无状态的请求-响应模式，每一轮对话或反思在底层其实都是两个独立的 HTTP 流式请求。
+// 为了在逻辑上让用户感觉它们属于“同一个流”，是通过 EventBus 传递相同的 SessionID ，实现逻辑上流的绑定。
+
 // streamReflectionToEventBus streams reflection process through EventBus
 // Note: Reflection is now handled through the think tool in main loop
 func (e *AgentEngine) streamReflectionToEventBus(
@@ -709,13 +883,13 @@ func (e *AgentEngine) streamReflectionToEventBus(
 
 	fullReflection, _, err := e.streamLLMToEventBus(
 		ctx,
-		messages,
-		&chat.ChatOptions{Temperature: 0.5},
-		func(chunk *types.StreamResponse, fullContent string) {
+		messages,                            // 专门为反思构造的提示词
+		&chat.ChatOptions{Temperature: 0.5}, // 反思通常需要更稳定的输出
+		func(chunk *types.StreamResponse, fullContent string) { // 处理反思过程中的碎块 (Chunks)
 			if chunk.Content != "" {
 				e.eventBus.Emit(ctx, event.Event{
-					ID:        reflectionID, // Same ID for all chunks in this stream
-					Type:      event.EventAgentReflection,
+					ID:        reflectionID,               // Same ID for all chunks in this stream
+					Type:      event.EventAgentReflection, // 发送的是“反思类型”的事件
 					SessionID: sessionID,
 					Data: event.AgentReflectionData{
 						ToolCallID: toolCallID,
@@ -734,6 +908,164 @@ func (e *AgentEngine) streamReflectionToEventBus(
 
 	return fullReflection, nil
 }
+
+// streamThinkingToEventBus 调用 LLM 执行推理阶段，并将思考过程与工具调用决策实时流式推送至事件总线。
+// 该函数是 ReAct 循环中 "Think" 环节的核心实现，负责连接底层 LLM 流式接口与上层事件驱动架构。
+//
+// 主要功能：
+// 1. 配置构建：根据 AgentConfig 动态设置温度 (Temperature)、可用工具列表 (Tools) 及思考模式 (Thinking)。
+// 2. 流式监听：委托 `streamLLMToEventBus` 处理底层 SSE/Stream 连接，实时捕获文本块与工具调用信号。
+// 3. 事件分发：
+//    - 思考内容 (Thought)：将 LLM 生成的文本片段封装为 `EventAgentThought` 事件，使用统一的 ThinkingID 标识同一轮次的连续输出，支持前端打字机效果。
+//    - 工具挂起 (ToolCall Pending)：在流式中解析出工具调用意图时，立即发射 `EventAgentToolCall` (Pending 状态)，通知前端即将执行的动作，减少等待感知。
+// 4. 防重处理：内部维护 `pendingToolCalls` 映射，确保同一工具调用 ID 在流式过程中仅触发一次“开始”事件。
+// 5. 结果聚合：收集完整的思考文本 (`fullContent`) 和结构化工具调用列表 (`toolCalls`)，组装为标准 `ChatResponse` 供后续逻辑使用。
+//
+// 异常处理：
+// - 若底层 LLM 流式调用失败（网络中断、API 错误），直接返回 error，由上层 `executeLoop` 进行统一错误处理与重试决策。
+//
+// 参数说明:
+// - ctx: 上下文，用于控制超时与链路追踪。
+// - messages: 当前对话历史（含 System Prompt 与过往交互），作为 LLM 的输入上下文。
+// - tools: 当前轮次可用的工具定义 schema，指导 LLM 进行 Function Calling。
+// - iteration: 当前 ReAct 迭代轮次索引，用于事件数据标记与日志区分。
+// - sessionID: 会话唯一标识，确保事件路由到正确的客户端连接。
+//
+// 返回:
+// - *types.ChatResponse: 包含完整思考内容、解析后的工具调用列表及结束原因的标准响应对象。
+// - error: 若 LLM 调用失败则返回错误，否则为 nil。
+
+// 它将 LLM 生成的原始字节流解析为有意义的业务事件（思考片段或工具意图），并立即通过 EventBus 推送给前端。
+
+// 1. 核心机制：回调处理 (Callback Design)
+// 	e.streamLLMToEventBus 在接收 LLM 响应的过程中，每解析出一个“数据块” (Chunk)，就会调用传入的回调函数。
+//  这个回调函数的作用是：
+// 		在 LLM 生成内容的每一毫秒，实时拦截数据流，解析其中的意图（是纯文本思考还是工具调用），
+//		并立即通过事件总线（EventBus）推送给前端。
+//		目的:
+//			将原始的 LLM 数据流转换为业务层面的事件流。
+//		输入:
+//			- chunk: 当前这一小片数据（可能包含几个字符的文本，或者一个工具调用的片段）。
+//			- fullContent: 到目前为止累积的所有文本内容（用于最终返回）。
+//		效果:
+//			- 异步性：不需要等待 LLM 生成完整个长句子，用户就能看到逐字蹦出的效果。
+//			- 解耦：底层负责网络流解析，回调函数负责业务逻辑分发。
+//		这种设计实现了真正的“流式交互”，让用户在 LLM 完全生成完回答之前，就能看到思考过程和即将执行的动作。
+//
+// 2. 逻辑分支一：检测并处理工具调用 (Tool Call Detection)
+//		触发条件:
+//			当 chunk 的类型被标记为 ResponseTypeToolCall（说明 LLM 决定调用工具了）。
+//		数据提取:
+//			从 chunk.Data 中提取 tool_call_id（工具调用的唯一ID）和 tool_name（工具名称）。
+//		防重机制 (De-duplication):
+//			问题:
+//				LLM 的流式输出中，同一个工具调用可能会分多个 Chunk 返回，
+//				例如第一个 Chunk 说“我要调用A”，第二个 Chunk 又确认了一遍“调用A”。
+//				如果不处理，前端会收到多次“开始调用”的事件，导致界面重复渲染加载动画。
+//			解决:
+//				使用 pendingToolCalls map 记录已经发射过事件的 toolCallID。
+//				只有当 !pendingToolCalls[toolCallID] 为真时（即第一次见到这个 ID），
+//				才发射事件并标记为 true。
+//		事件发射:
+//			Type:
+//				event.EventAgentToolCall。
+//			作用:
+//				通知前端“Agent 决定执行 XX 工具”。
+//				前端此时可以立即显示该工具的图标、名称和“执行中...”的状态，无需等待工具真正执行完毕。
+//				这极大地提升了响应速度的感知。
+//
+//
+// 3. 逻辑分支二：思维链流式展示 (EventAgentThought)
+//		触发条件: 当 chunk.Content 不为空（说明 LLM 正在输出自然语言，即“思考过程”或“最终回答”）。
+//		关键设计 - 统一 ID (thinkingID):
+//			注意: 这里使用的 Event ID 是外层定义的 thinkingID，而不是 chunk 自带的 ID。
+//			意义: 这意味着这一轮思考产生的所有文本碎片（Chunk 1, Chunk 2, ... Chunk N）都属于同一个逻辑事件。
+//			前端收益: 前端接收到这些事件时，可以根据相同的 ID 将它们拼接起来，实现流畅的打字机效果 (Typewriter Effect)，而不是渲染成多条独立的消息气泡。
+//		完成标记 (Done):
+//			chunk.Done 指示这是否是最后一个包。
+//			前端收到 Done: true 后，可以停止加载动画，光标停止闪烁，表示思考阶段结束。
+
+// streamThinkingToEventBus 驱动 LLM 进行流式推理，实时捕获“思考文本”与“工具调用意图”并推送至事件总线。
+// 该函数充当“流量调度器”，根据每个 Chunk 的类型，将其动态路由到不同的事件通道，实现前端界面的毫秒级即时反馈。
+//
+// 【工作流程示例】
+// 假设 LLM 流式返回以下 5 个数据块 (Chunks)：
+//  1. Chunk{Content: "我需要先"}
+//  2. Chunk{Content: "查询北京的天气。"}
+//  3. Chunk{Type: ToolCall, Data: {ID: "call_001", Name: "get_weather"}}
+//  4. Chunk{Content: "查询完后我会发送邮件。"}
+//  5. Chunk{Type: ToolCall, Data: {ID: "call_002", Name: "send_email"}}
+//
+// 【动态分流示例】
+// 假设 LLM 按时间顺序返回以下 5 个独立的数据块 (Chunks)，代码将对每一块进行即时分流：
+//
+//  -> 接收 Chunk 1: {"content": "我需要先"}
+//     [分流逻辑]: 命中 Content 分支 (Content != "")。
+//     [动作]: 发射 EventAgentThought (Content="我需要先", Done=false)。
+//     [前端]: 屏幕立即显示文字：“我需要先” (光标闪烁，等待后续)。
+//
+//  -> 接收 Chunk 2: {"content": "查询北京的天气。"}
+//     [分流逻辑]: 再次命中 Content 分支。
+//     [动作]: 发射 EventAgentThought (Content="查询北京的天气。", Done=false)。
+//     [前端]: 文字无缝拼接，显示为：“我需要先查询北京的天气。”
+//
+//  -> 接收 Chunk 3 (工具信号): {"type": "tool_call", "data": {"id": "call_001", "name": "get_weather"}}
+//     [分流逻辑]: 命中 ToolCall 分支 (跳过 Content 分支)。
+//     [动作]: 检查 pendingToolCalls 防重 -> 发射 EventAgentToolCall (Pending)。
+//     [前端]: 文字流下方立即弹出状态卡片：“🌤️ 准备调用 get_weather...” (此时工具尚未执行)。
+//
+//  -> 接收 Chunk 4 (纯文本): {"content": "查询完后我会发送邮件。"}
+//     [分流逻辑]: 再次跳回 Content 分支。
+//     [动作]: 继续发射 EventAgentThought。
+//     [前端]: 文字继续滚动，紧接上一句显示：“...查询完后我会发送邮件。”
+//
+//  -> 接收 Chunk 5 (工具信号): {"type": "tool_call", "data": {"id": "call_002", "name": "send_email"}}
+//     [分流逻辑]: 再次跳入 ToolCall 分支。
+//     [动作]: 发射第二个工具的 Pending 事件。
+//     [前端]: 界面追加第二个状态卡片：“📧 等待调用 send_email...”。
+//
+// 核心机制:
+//  1. 互斥分流：每个 Chunk 仅被处理一次，文本归文本流，指令归指令流，互不阻塞。
+//  2. 上下文连续：尽管处理逻辑在“跳跃”，但所有文本 Chunk 共用同一个 thinkingID，保证前端渲染出的思考内容是连贯的段落。
+//  3. 即时感知：工具调用指令一旦在流中出现（哪怕在句子中间），立即触发前端 UI 变化，无需等待整段话结束。
+//  4. 结果聚合：流结束后，返回拼接好的完整文本 (fullContent) 和结构化好的工具列表 (toolCalls) 供后续执行。
+//
+// 参数说明:
+//  - ctx: 上下文控制。
+//  - messages: 当前对话历史。
+//  - tools: 可用工具定义列表。
+//  - iteration: 当前 ReAct 循环轮次。
+//  - sessionID: 会话 ID。
+//
+// 返回:
+//  - *types.ChatResponse: 包含完整思考内容与解析后的工具调用列表。
+//  - error: 流式连接或解析失败时返回错误。
+
+// 工具不会在 streamThinkingToEventBus 函数执行期间（即接收 Chunk 时）真正运行。
+// 真正的执行发生在上一级的主循环（executeLoop）中，拿到完整的工具列表后统一执行。
+//
+// 为什么要这样设计？（为什么不收到一个 Chunk 就执行一个？）
+//	完整性校验:
+//		LLM 生成的工具调用参数可能是分散在多个 Chunk 里的（例如 {"city": "Bei ... jing"}）。
+//		如果在流中间就执行，参数可能还没收全，导致执行报错。
+//		所以必须等流结束，拿到完整、合法的 JSON 参数后才能执行。
+//	批量执行优化:
+//		有时候 LLM 会一次性决定调用多个工具（如例子中的天气 + 邮件）。
+//		系统可以收集完所有工具调用后，选择并行执行（Go 语言的 go routine 优势），
+//		而不是串行地等一个做完再做下一个，这样速度更快。
+//	事务一致性:
+//		如果执行到一半发现参数错误，或者上下文变了，在流结束后统一处理更容易进行错误回滚或整体重试。
+//
+// 真正的执行时机：Act 阶段 ，每一轮（Round）的 Act 阶段都可能会调用工具。
+//	在 executeLoop 函数中，执行流程：
+//		Wait (等待流结束)：
+//			response, err := e.streamThinkingToEventBus(...) 这一行会阻塞，直到 LLM 把最后一个字符传完、连接关闭。
+//		Collect (汇总数据)：
+//			此时，response.ToolCalls 已经拿到了完整的 JSON 参数（例如：{"city": "Beijing"}）。
+//		Execute (真正调用)：
+//			for _, tc := range response.ToolCalls {
+//			   result, err := e.toolRegistry.ExecuteTool(ctx, tc.Function.Name, ...) // 这里才是真正的执行！
+//			}
 
 // streamThinkingToEventBus streams the thinking process through EventBus
 func (e *AgentEngine) streamThinkingToEventBus(
@@ -958,4 +1290,9 @@ func (e *AgentEngine) buildMessagesWithLLMContext(
 	})
 
 	return messages
+}
+
+// generateEventID generates a unique event ID with type suffix for better traceability
+func generateEventID(suffix string) string {
+	return fmt.Sprintf("%s-%s", uuid.New().String()[:8], suffix)
 }

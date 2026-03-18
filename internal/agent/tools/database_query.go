@@ -12,6 +12,25 @@ import (
 	"gorm.io/gorm"
 )
 
+// 代码执行流程 (Execute)
+//	上下文提取: 获取当前请求的 tenantID。
+//	参数解析: 将 AI 传来的 json.RawMessage 解析为 DatabaseQueryInput 结构体，提取 SQL 字符串。
+//	基础校验: 检查 SQL 是否为空。
+//	安全加固 (核心步骤):
+//		调用 validateAndSecureSQL，内部委托给 utils.ValidateAndSecureSQL，传入安全选项（默认注入租户信息、注入检查条件）。
+//		如果验证失败（如包含非 SELECT 语句、语法错误、未通过白名单），直接返回错误，不执行查询。
+//	执行查询:
+//		使用 GORM 的 Raw(securedSQL).Rows() 执行最终的安全 SQL。
+//	结果处理:
+//		动态获取列名 (rows.Columns())。
+//		遍历每一行，将 []byte 类型转换为 string ，构建 map[string]interface{} 列表。
+//		处理 NULL 值。
+//	格式化输出:
+//		调用 formatQueryResults 生成人类可读的文本报告（包含执行 SQL、行数、详细记录）。
+//		同时构建 Data 字段，包含原始列、行数据、行数等结构化信息，方便程序化使用。
+//	日志记录:
+//		全程记录关键步骤（原始 SQL、安全 SQL、行数、错误信息），便于审计和调试。
+
 var databaseQueryTool = BaseTool{
 	name: ToolDatabaseQuery,
 	description: `Execute SQL queries to retrieve information from the database.

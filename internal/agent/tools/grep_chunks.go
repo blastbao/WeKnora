@@ -14,6 +14,66 @@ import (
 	"gorm.io/gorm"
 )
 
+// grepChunksTool 是一个 “知识库版的 Unix Grep”，专门用于在 RAG 系统中执行确定性的全文关键字匹配，而非模糊的语义搜索。
+// 这是一个“确定性”的搜索工具，它不依赖 AI 的“理解能力”，而是依赖计算机最擅长的“字符串匹配”，
+// 并辅以去重、打分、多样性优化等高级策略，确保返回的结果既精准又不冗余，是 RAG 系统中处理精确事实查找的利器。
+//
+// 典型应用场景
+//	排查特定错误码：用户问“有没有包含 Error 503 或 Connection Timeout 的日志？”。语义搜索可能理解不了具体的错误码格式，但 grep 能精准命中。
+//	验证专有名词：用户想确认文档里是否提到了具体的版本号（如 v2.4.1-beta）或内部项目代号。
+//	快速过滤：在海量文档中，先通过关键词圈定范围，再让 LLM 进行深度分析。
+//	调试解析问题：如果语义搜索找不到内容，用 grep 搜一下原文，可以判断是“根本没存进去”还是“向量 embedding 没做好”。
+
+// Q: 为什么要用 Grep 而不是向量搜索？
+//
+//	尽管向量搜索（Semantic Search）很强大，但在处理以下场景时往往会“翻车”：
+//	 - 专有名词/版本号：比如搜索 v3.2.1-build-88，向量模型可能会把它和 v3.2.0 混为一谈，而 Grep 必须完全匹配。
+//	 - 唯一标识符：如特定的错误代码（ERR_00912）、身份证号、零件编号。
+//	 - 确定性需求：用户明确要求“包含某个词”的结果。
+
+// 第一阶段：输入校验与权限准备
+//
+//	参数解析：接收 pattern (关键词列表，必填), knowledge_base_ids (可选), max_results (默认50)。
+//	强制规则检查：虽然代码中未显式抛出错误，但注释强调 pattern 必须是短关键词（1-3个词），严禁长句，否则命中率极低。
+//	权限过滤：从 searchTargets 获取用户有权访问的 KB 列表及其对应的 tenant_id。如果用户指定了 KB ID，会再次校验是否在允许列表中。
+//
+// 第二阶段：数据库检索 (searchChunks)
+//
+//	使用了 GORM 构建复杂的 SQL：
+//		动态 WHERE 子句：
+//			租户隔离：生成 (kb_id = A AND tenant_id = X) OR (kb_id = B AND tenant_id = Y) 这样的条件，确保只查有权访问的数据。
+//			关键词匹配：生成 (content ILIKE '%key1%') OR (content ILIKE '%key2%')。
+//		关联查询：LEFT JOIN knowledges 以获取文档标题 (knowledge_title) 和该文档的总分块数 (total_chunk_count)。
+//		初步筛选：只查 is_enabled = true 且未删除的数据。
+//
+// 第三阶段：后处理与优化 (核心算法部分)
+//
+//	拿到原始数据库结果后，代码进行了一系列精细的处理，以提升结果质量：
+//		去重 (deduplicateChunks)：
+//			ID 去重：防止同一分块被多次返回。
+//			内容指纹去重：通过 buildContentSignature 计算内容签名，去除内容高度相似的重复分块（例如同一文档不同版本的相似段落）。
+//		打分 (scoreChunks)：
+//			匹配数量：命中的关键词越多，分数越高。
+//			位置加权：关键词出现在分块内容的越靠前，分数略高（给予 positionBonus）。
+//			输出 MatchScore (0.0 - 1.0) 和 MatchedPatterns (命中了几个词)。
+//
+//		多样性优化 (applyMMR - Maximal Marginal Relevance)：
+//			目的：防止返回的结果全是意思差不多的片段（冗余）。
+//			逻辑：如果结果超过 10 条，启动 MMR 算法。它在“相关性”（Relevance）和“多样性”（Diversity）之间做平衡。
+//			算法：使用 Jaccard 相似度 计算候选分块与已选分块的文本重合度。如果一个分块虽然相关，但与已选分块太像，就会被降权或剔除。
+//			效果：确保返回的 Top N 个结果覆盖了不同的上下文视角。
+//
+//		聚合统计 (aggregateByKnowledge)：
+//			将分散的“分块级”结果聚合成“文档级”视图。
+//			统计每个文档命中了多少个分块 (ChunkHitCount)。
+//			统计每个关键词在文档中出现的总次数 (PatternCounts)。
+//			排序：优先展示命中关键词种类最多 (DistinctPatterns)、总命中次数最多的文档。
+//
+// 第四阶段：输出格式化
+//
+//	人类可读文本：生成类似 grep 的输出，显示模式、匹配文档数，以及每个文档的命中详情（如：pattern_hits=[error=5, timeout=2]）。
+//	结构化数据：返回 JSON 数据供前端渲染，包含聚合后的文档列表、命中统计等。
+
 var grepChunksTool = BaseTool{
 	name: ToolGrepChunks,
 	description: `Unix-style text pattern matching tool for knowledge base chunks.
