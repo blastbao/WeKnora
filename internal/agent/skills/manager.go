@@ -171,6 +171,47 @@ func (m *Manager) ListSkillFiles(ctx context.Context, skillName string) ([]strin
 	return m.loader.ListSkillFiles(skillName)
 }
 
+// ExecuteScript 在沙箱环境中执行指定技能下的脚本文件。
+//
+// 该函数是运行技能相关可执行代码的安全入口，实施了多层防御策略以确保安全性和隔离性：
+//
+// 1. 授权与配置检查：
+//   - 验证技能系统全局开关是否已启用。
+//   - 校验请求的技能名称是否在允许列表（白名单）中。
+//   - 确认沙箱管理器已正确配置且可用。
+//
+// 2. 文件验证与安全解析：
+//   - 通过 m.loader.GetSkillBasePath 获取技能的绝对根目录路径。
+//   - 使用安全路径解析机制加载目标文件（防止路径穿越攻击）。
+//   - 验证文件类型标记，确保只有被识别为可执行脚本的文件（如 .py, .sh）才能运行。
+//
+// 3. 沙箱隔离执行：
+//   - 构建执行配置，使用文件的绝对路径。
+//   - 将工作目录 (WorkDir) 强制锁定在技能的基础路径下，限制文件访问范围。
+//   - 委托沙箱管理器执行，确保脚本在隔离环境（容器/受限进程）中运行，无法危害主机。
+//
+// 参数说明：
+//   - ctx: 上下文对象，用于控制执行超时和取消操作。
+//   - skillName: 技能名称。
+//   - scriptPath: 脚本文件相对路径。
+//   - args: 命令行参数。
+//   - stdin: 标准输入。
+//
+// 返回值：
+//   - *sandbox.ExecuteResult: 脚本执行结果（包含输出、退出码等）。
+//   - error: 若任何验证步骤失败或执行出错，返回相应错误。
+//		  - 技能系统未启用
+//		  - 技能未授权访问
+//		  - 沙箱未配置
+//		  - 技能目录不存在
+//		  - 脚本文件不存在或无效
+//		  - 沙箱执行失败
+//
+// 安全设计：
+// - 权限隔离：技能必须在白名单中才允许执行
+// - 沙箱隔离：在独立沙箱环境中运行脚本
+// - 路径安全：使用绝对路径，工作目录限制在技能路径内
+
 // ExecuteScript executes a script from a skill in the sandbox
 func (m *Manager) ExecuteScript(ctx context.Context, skillName, scriptPath string, args []string, stdin string) (*sandbox.ExecuteResult, error) {
 	if !m.enabled {

@@ -7,6 +7,66 @@ import (
 	"strings"
 )
 
+// 三层加载机制
+//	Level 1	DiscoverSkills()		只读取元数据（Frontmatter），轻量级扫描
+//	Level 2	LoadSkillInstructions()	加载完整 Skill 说明文档
+//	Level 3	LoadSkillFile()			按需加载 Skill 目录下的额外文件
+
+// Level 1: 发现与元数据提取 (DiscoverSkills)
+//	功能：扫描所有配置的目录 (skillDirs)，寻找包含 SKILL.md 的子文件夹。
+//	行为：
+//		只读取 SKILL.md 文件。
+//		解析 YAML Frontmatter，提取 Name 和 Description。
+//		不加载具体的指令正文 (Instructions)。
+//		将结果缓存到 l.discoveredSkills 中（此时 Loaded=false）。
+//	目的：快速构建“技能清单”，供 System Prompt 使用。即使有 100 个技能，每个技能有 5000 字指令，这一步也几乎不消耗 Token 和内存。
+//
+// Level 2: 按需加载指令 (LoadSkillInstructions)
+//	触发时机：当 LLM 决定调用某个具体技能时（例如用户说“帮我执行 web-search”）。
+//	行为：
+//		检查缓存：如果已加载且 Loaded=true，直接返回。
+//		如果未加载：去文件系统读取完整的 SKILL.md，解析出 Instructions 正文。
+//		更新缓存状态：标记 Loaded=true。
+//	智能查找：支持两种查找方式：
+//		路径匹配：直接尝试 dir/skillName/SKILL.md（最快）。
+//		名称扫描：如果路径不匹配，遍历目录下所有子文件夹，比对 name 字段（容错性强）。
+//
+// Level 3: 安全加载资源文件 (LoadSkillFile)
+//	触发时机：当技能指令中需要读取额外的脚本、模板或文档时（例如 resources/script.py）。
+//	关键特性：安全性 (Security)
+//		路径清洗：使用 filepath.Clean 标准化路径。
+//		防穿越攻击 (Path Traversal)：
+//			禁止 .. 开头。
+//			禁止绝对路径。
+//			双重验证：计算文件的绝对路径，确保它必须以技能目录的绝对路径为前缀。
+//			例子：如果技能在 /skills/search，试图读取 /skills/search/../../etc/passwd 会被拦截，因为解析后的真实路径不在 /skills/search 下。
+//	自动识别：
+//		返回的 SkillFile 对象会自动标记 IsScript 和对应的语言，方便后续执行。
+
+// 流程示例
+//
+//	假设系统配置了 ./plugins 目录，里面有一个 weather 技能。
+//
+//	启动时：
+//		调用 loader.DiscoverSkills()。
+//		扫描到 ./plugins/weather/SKILL.md。
+//		读取头部 YAML，得到 {name: "weather", desc: "查询天气"}。
+//		存入缓存。此时 Instructions 字段为空。
+//
+//	用户问：“今天北京天气怎么样？”
+//		LLM 分析后决定调用 weather 技能。
+//		主程序调用 loader.LoadSkillInstructions("weather")。
+//		检测到缓存中 Loaded=false。
+//		读取 ./plugins/weather/SKILL.md 全文，解析出详细的 API 调用步骤。
+//		更新缓存 Loaded=true。
+//		返回完整 Skill 对象给 LLM 执行。
+//	执行中：
+//		技能指令说：“请运行 scripts/fetch.py”。
+//		主程序调用 loader.LoadSkillFile("weather", "scripts/fetch.py")。
+//		进行安全校验，确认文件在 ./plugins/weather 内。
+//		读取文件内容，标记为 Python 脚本。
+//		返回内容供执行器运行。
+
 // Loader handles skill discovery and loading from the filesystem
 // It implements the Progressive Disclosure pattern by separating
 // metadata discovery (Level 1) from instructions loading (Level 2/3)
