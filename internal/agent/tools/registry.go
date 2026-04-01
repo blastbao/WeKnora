@@ -108,6 +108,17 @@ func (r *ToolRegistry) ExecuteTool(
 	return result, execErr
 }
 
+// Cleanup 清理所有已注册工具中实现了清理方法的资源。
+//
+// 该函数目前专门针对 `DataAnalysisTool` 进行特定的资源释放处理。
+// 它遍历工具注册表，检查是否存在名为 `ToolDataAnalysis` 的工具实例。
+// 如果存在且类型断言成功，则调用该实例的 `Cleanup` 方法以释放上下文相关的资源（如临时文件、数据库连接等）。
+//
+// 注意：当前实现仅显式处理数据分析工具，其他工具若需清理逻辑需在此处扩展或实现通用接口。
+//
+// 参数:
+//   - ctx: 上下文控制，用于传递取消信号或超时控制，确保清理操作安全终止。
+
 // Cleanup cleans up all registered tools that implement the Cleanup method
 func (r *ToolRegistry) Cleanup(ctx context.Context) {
 	// Check specifically for DataAnalysisTool

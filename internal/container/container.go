@@ -59,6 +59,96 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// BuildContainer 构建依赖注入容器
+//
+// 该函数是应用启动的核心，按层次注册所有组件，建立完整的依赖图。
+// 注册顺序遵循依赖方向：基础设施 -> 仓库 -> 服务 -> 管道 -> 处理器 -> 路由
+//
+// 第一层 - 基础设施 (Core Infrastructure):
+//   - ResourceCleaner: 资源清理器，用于应用关闭时释放资源
+//   - Config: 配置加载
+//   - Tracer: OpenTelemetry分布式追踪
+//   - Database: PostgreSQL连接 (GORM)
+//   - FileService: 文件存储服务（根据STORAGE_TYPE环境变量选择实现）
+//   - RedisClient: Redis连接
+//   - AntsPool: 协程池，控制并发任务数量
+//   - ContextStorage: LLM上下文存储（基于Redis）
+//
+// 第二层 - 检索引擎 (Retrieval Engines):
+//   - RetrieveEngineRegistry: 搜索引擎注册中心，支持多引擎并存
+//   - 根据RETRIEVE_DRIVER环境变量注册一个或多个引擎:
+//     * postgres: PostgreSQL全文检索
+//     * elasticsearch_v7/v8: Elasticsearch向量检索
+//     * qdrant: Qdrant向量数据库
+//     * milvus: Milvus向量数据库
+//
+// 第三层 - 外部客户端 (External Clients):
+//   - DocReaderClient: 文档解析服务客户端
+//   - OllamaService: Ollama本地模型服务客户端
+//   - Neo4jClient: 图数据库客户端（NEO4J_ENABLE=true时启用）
+//   - StreamManager: 流式响应管理器
+//   - DuckDB: 内存SQL分析引擎（用于数据分析）
+//
+// 第四层 - 数据仓库 (Repositories):
+//   - 租户、知识库、知识文件、文档块、标签等基础数据仓库
+//   - Neo4jRepository: 图数据仓库
+//   - MemoryRepository: 记忆图谱仓库
+//   - MCPServiceRepository: MCP服务仓库
+//   - CustomAgentRepository: 自定义Agent仓库
+//   - 组织、共享等权限相关仓库
+//
+// 第五层 - 业务服务 (Services):
+//   - 基础服务: Tenant, KnowledgeBase, Organization, Knowledge, Chunk等
+//   - 提取服务: ChunkExtractService(文档提取), DataTableSummaryService(表格摘要)
+//   - 消息与模型服务: Message, Model, MCP, CustomAgent
+//   - MemoryService: 记忆管理服务
+//   - WebSearchRegistry & WebSearchService: 网络搜索服务
+//   - AgentService: Agent引擎服务（依赖EventBus和WebSearch）
+//   - SessionService: 会话服务（依赖AgentService）
+//
+// 第六层 - 异步任务 (Async Tasks):
+//   - AsynqClient: 异步任务客户端
+//   - AsynqServer: 异步任务服务器（后台处理队列）
+//
+// 第七层 - 聊天管道 (Chat Pipeline):
+//   按执行顺序注册插件（EventManager已预注册）:
+//   1. PluginTracing: 追踪埋点
+//   2. PluginSearch: 文档检索
+//   3. PluginRerank: 结果重排序
+//   4. PluginMerge: 结果合并
+//   5. PluginDataAnalysis: 数据分析
+//   6. PluginIntoChatMessage: 转换为聊天消息
+//   7. PluginChatCompletion: LLM非流式调用
+//   8. PluginChatCompletionStream: LLM流式调用
+//   9. PluginStreamFilter: 流式响应过滤
+//   10. PluginFilterTopK: TopK过滤
+//   11. PluginRewrite: 查询重写
+//   12. PluginLoadHistory: 历史加载
+//   13. PluginExtractEntity: 实体提取
+//   14. PluginSearchEntity: 实体搜索（图谱）
+//   15. PluginSearchParallel: 并行搜索
+//   16. MemoryPlugin: 记忆处理
+//
+// 第八层 - HTTP处理器 (Handlers):
+//   为各业务领域提供REST API端点:
+//   - Tenant, KnowledgeBase, Knowledge, Chunk, FAQ, Tag
+//   - Session, Message, Model, Evaluation
+//   - Initialization, Auth, System
+//   - MCPService, WebSearch, CustomAgent, Skill, Organization
+//
+// 第九层 - 路由与启动 (Router & Startup):
+//   - Router: HTTP路由配置
+//   - RunAsynqServer: 启动后台任务服务器
+//
+// 错误处理:
+//   所有Provide/Invoke操作通过must()辅助函数处理，初始化失败会立即panic，
+//   确保应用在配置错误时快速失败，避免运行时出现未预期的nil依赖。
+//
+// 注意事项:
+//   - KBShareService必须在KnowledgeService和KnowledgeTagService之前注册（存在依赖）
+//   - SessionService创建后会传递给AgentService.CreateAgentEngine
+//   - 聊天管道插件通过Invoke注册，确保EventManager已存在
+
 // BuildContainer constructs the dependency injection container
 // Registers all components, services, repositories and handlers needed by the application
 // Creates a fully configured application container with proper dependency resolution

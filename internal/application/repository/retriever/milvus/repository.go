@@ -66,6 +66,168 @@ func (m *milvusRepository) getCollectionName(dimension int) string {
 	return fmt.Sprintf("%s_%d", m.collectionBaseName, dimension)
 }
 
+// 集合（Collection） 是 Milvus 中类似于关系型数据库"表"的概念，用于存储向量数据和对应的标量字段。
+//
+// “指定维度的集合” 是指代码为每一种向量维度单独创建一个集合，通常在集合名中包含维度信息，例如：
+//	- weknora_embeddings_768  - 存储 768 维向量
+//	- weknora_embeddings_1536 - 存储 1536 维向量
+//	- weknora_embeddings_1024 - 存储 1024 维向量
+//
+// 在 Milvus 中，向量的维度（Dimension）是在创建集合（Collection）时确定的，
+// 一旦创建，该集合中所有向量的维度必须完全一致，且无法修改。
+//
+// 由于 Milvus 不允许在一个集合里混存不同维度的向量，存入向量前需要根据维度信息，动态地查找或创建对应的集合。
+
+// 稠密向量（Dense Vector）是通过神经网络模型（如 BERT、OpenAI Embedding）将文本映射到高维连续空间中的向量表示。
+//
+//	embedding := []float32{					// 稠密向量示例（768维，每个维度都有值）
+//	   0.123, -0.456, 0.789, ..., 0.567, 	// 768 个非零值
+//	}
+//
+// 当你把一句话变成稠密向量（例如 768 个浮点数）时，神经网络模型（如 BERT, Embedding 模型）做的是语义编码。
+// 它把“苹果”、“水果”、“红色”、“好吃”这些概念压缩成一串数字。
+//	优点：它能理解“汽车”和“轿车”是相似的，即使字面上完全不同。
+//	缺点：在这个过程中，具体的字词信息被“模糊化”甚至丢失了。向量空间中的距离代表“意思相近”，而不是“字面相同”。
+//
+// 具体场景演示：
+//	文档：“iPhone 15 Pro Max 的电池容量是 4422 mAh。”
+//	查询：“iPhone 15 Pro Max 电池容量”
+//	稠密向量表现：✅完美匹配。因为语义完全一致。
+//
+//	查询：“型号 XQ-72B 的电压参数” (假设 XQ-72B 是一个特定的、生僻的产品型号)
+//	稠密向量表现：❌极差。
+//	原因：
+//		模型在训练时可能从未见过 “XQ-72B” 这个词，或者它把这个生僻词映射到了一个很普通的向量位置。
+//		它可能会返回关于“电压”的通用文档，或者完全不相关的其他型号文档，
+//		因为它无法通过向量距离精确锁定这个特定的字符串。
+//
+//	查询：“错误代码 0x80070005”
+//	稠密向量表现：❌失效。这种毫无语义规律的随机字符串，在向量空间中很难找到精确的最近邻。
+//
+// 结论：
+//	稠密向量擅长“意会”（Semantic Search），但不擅长“言传”（Keyword Search）。
+//	对于专有名词、版本号、错误码、特定人名等精确匹配需求，稠密向量往往无能为力。
+
+// 稀疏向量是通过统计方法（如 TF-IDF、BM25）将文本映射到高维稀疏空间中的向量表示。
+//
+// 稀疏向量本质是一个高维空间的索引结构，每个维度对应一个词汇，值代表该词汇在文档中的重要性权重。
+// 当你把一句话变成稀疏向量时，算法做的是“词频统计”与“逆文档频率加权”。
+// 它把“iPhone”、“15”、“Pro”、“Max”这些具体的词，映射到词典中对应的唯一 ID 上，并赋予权重。
+// 	优点：它能精确锁定“XQ-72B”和“0x80070005”，只要文档里有这个词，分数就高，绝无模糊。
+// 	缺点：它不懂同义词，搜“轿车”匹配不到“汽车”，因为它只认字面，不懂语义。
+//
+// 稀疏向量示例（词汇表大小 100 万，只有少数维度有值）：
+//
+// sparseVector := map[int]float32{
+//     12345: 2.5,  // 词汇 "Milvus" 的 BM25 分数
+//     67890: 1.8,  // 词汇 "向量" 的 BM25 分数
+//     11111: 0.5,  // 词汇 "数据库" 的 BM25 分数
+//     				// 其他 999,997 个维度都是 0（不存储）
+// }
+//
+// 当你把一句话变成稀疏向量时，你实际上是在构建一个“词汇-权重”映射表。
+// 每个维度对应词汇表中的一个词，维度值代表这个词在文档中的重要程度。
+// 	优点：它能精确匹配关键词，保留所有词汇信息，不会丢失字面细节。
+// 	缺点：它不理解语义，无法识别同义词，"汽车"和"轿车"被认为是完全不同的词。
+//
+// 具体场景演示：
+// 	文档："iPhone 15 Pro Max 的电池容量是 4422 mAh。"
+// 	查询："iPhone 15 Pro Max 电池容量"
+// 	稀疏向量表现：✅完美匹配。因为查询中的每个词都在文档中出现。
+//
+// 	查询："型号 XQ-72B 的电压参数"（假设 XQ-72B 是一个特定的、生僻的产品型号）
+// 	稀疏向量表现：✅完美匹配。只要文档中包含精确的 "XQ-72B" 字符串。
+// 	原因：
+//     稀疏向量把 "XQ-72B" 当作一个独立的词汇项，在索引中记录哪些文档包含这个词。
+//     搜索时，会精确返回所有包含这个词的文档，不会混淆。
+//
+// 	查询："错误代码 0x80070005"
+// 	稀疏向量表现：✅完美。这种看似随机的字符串，对稀疏向量来说只是另一个词汇项。 只要索引中有这个词，就能精确找到。
+//
+// 	查询："电动汽车"
+// 	文档A："特斯拉电动车续航600公里"
+// 	文档B："新能源汽车充电桩"
+// 	稀疏向量表现：❌较差。因为"电动汽车"和"电动车"被认为是不同的词。
+//     如果文档中只写"电动车"而不写"电动汽车"，可能搜不到。它不知道"汽车"和"轿车"是类似的。
+//
+// 结论：
+// 	稀疏向量擅长“言传”（Keyword Search），是解决专有名词、版本号、错误码、特定术语检索的银弹。
+// 	但它无法“意会”，必须与稠密向量配合（混合检索），才能同时兼顾语义理解和精确匹配。
+
+// ensureCollection 确保指定维度的 Milvus 集合存在、schema 正确且已加载至内存。
+//
+// 执行流程：
+// 1. 检查本地缓存：如果该维度已初始化成功，直接返回，避免重复操作。
+// 2. 检查集合存在性：调用 Milvus API 确认集合是否已创建。
+// 3. 自动创建集合（若不存在）：
+//    - 定义包含稠密向量、稀疏向量（用于 BM25 全文检索）、文本内容及业务元数据的 Schema。
+//    - 配置 BM25 函数，自动将文本内容转换为稀疏向量。
+//    - 建立索引：稠密向量使用 HNSW 索引，稀疏向量使用 AutoIndex(BM25)，标量字段建立过滤索引。
+// 4. 加载集合：调用 LoadCollection 并将数据加载到查询节点内存中，确保可被搜索。
+// 5. 更新缓存：标记该维度为已初始化状态。
+//
+// Schema 设计：
+//   - 主键：id (VarChar, 最大 1024 字符)
+//   - 稠密向量：embedding (FloatVector)，用于语义相似度搜索
+//   - 稀疏向量：content_sparse (SparseVector)，通过 BM25 函数从 content 自动生成
+//   - 全文字段：content (VarChar, 最大 65535)，启用分词器和匹配功能
+//   - 业务字段：source_id, chunk_id, knowledge_id, knowledge_base_id, tag_id, is_enabled 等
+//
+// 索引配置：
+//   - embedding: HNSW 索引，相似度度量 IP，efConstruction=16, M=128
+//   - content_sparse: AutoIndex，使用 BM25 算法
+//   - 过滤字段：chunk_id, knowledge_id, knowledge_base_id, source_id, is_enabled 均建立标量索引
+//
+// 参数：
+//   - ctx: 上下文，用于控制超时和取消
+//   - dimension: 向量维度（如 768、1536），决定集合名称后缀
+//
+// 返回：
+//   - error: 如创建失败、加载失败等情况返回具体错误
+//
+// 线程安全：
+//   本函数内部使用 sync.Map 进行缓存，支持并发调用，但 Milvus 服务端操作是串行的。
+//
+// 示例：
+//
+//	if err := repo.ensureCollection(ctx, 1536); err != nil {
+//	    log.Fatalf("初始化集合失败: %v", err)
+//	}
+
+//	┌─────────────────────────────────────────────────────────────┐
+//	│                     应用层插入数据                             │
+//	│  embedding := &MilvusVectorEmbedding{                       │
+//	│      ID: "uuid-123",                                        │
+//	│      Content: "Milvus 向量数据库",                            │
+//	│      Embedding: [0.1, 0.2, ...],  // 手动提供                │
+//	│      ChunkID: "chunk-001",                                  │
+//	│      KnowledgeBaseID: "kb-123",                             │
+//	│      IsEnabled: true,                                       │
+//	│  }                                                          │
+//	└─────────────────────────┬───────────────────────────────────┘
+//	│
+//	▼
+//	┌─────────────────────────────────────────────────────────────┐
+//	│                 Milvus 插入处理                              │
+//	│  1. 存储 id 字段                                             │
+//	│  2. 存储 embedding 字段（稠密向量）                            │
+//	│  3. 存储 content 字段（原始文本）                              │
+//	│  4. 自动触发 BM25 函数                                        │
+//	│  5. 生成 content_sparse 字段（稀疏向量）                       │
+//	│  6. 存储所有业务字段                                          │
+//	│  7. 更新倒排索引（稀疏向量）                                    │
+//	│  8. 更新 HNSW 索引（稠密向量）                                 │
+//	│  9. 更新标量索引（业务字段）                                    │
+//	└─────────────────────────────────────────────────────────────┘
+//	│
+//	▼
+//	┌─────────────────────────────────────────────────────────────┐
+//	│                     可被检索                                 │
+//	│  向量检索：使用 embedding 字段 + HNSW 索引                      │
+//	│  关键词检索：使用 content_sparse 字段 + 倒排索引                 │
+//	│  过滤查询：使用业务字段 + 标量索引                               │
+//	└─────────────────────────────────────────────────────────────┘
+
 // ensureCollection ensures the collection exists for the given dimension
 func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) error {
 	collectionName := m.getCollectionName(dimension)
@@ -94,59 +256,101 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 			AutoID:         false,
 			Fields: []*entity.Field{
 				entity.NewField().
-					WithName(fieldID).
+					WithName(fieldID).                     // 字段名: "id"
+					WithDataType(entity.FieldTypeVarChar). // 字符串类型
+					WithIsPrimaryKey(true).                // 设为主键
+					WithMaxLength(1024),                   // 最大长度 1024 字符
+				entity.NewField().
+					WithName(fieldEmbedding).                  // 字段名: "embedding"
+					WithDataType(entity.FieldTypeFloatVector). // 稠密向量类型
+					WithDim(int64(dimension)),                 // 稠密向量维度（如 768、1536）
+				entity.NewField().
+					WithName(fieldContent). // 全文字段：content
 					WithDataType(entity.FieldTypeVarChar).
-					WithIsPrimaryKey(true).
-					WithMaxLength(1024),
+					WithMaxLength(65535).     // 最大长度 65535 字符（约 2 万汉字）
+					WithEnableAnalyzer(true). // 启用分词器（支持中文、英文等）
+					WithEnableMatch(true),    // 启用文本匹配功能
 				entity.NewField().
-					WithName(fieldEmbedding).
-					WithDataType(entity.FieldTypeFloatVector).
-					WithDim(int64(dimension)),
+					WithName(fieldContentSparse).               // 稀疏向量字段：content_sparse
+					WithDataType(entity.FieldTypeSparseVector), // 稀疏向量类型
 				entity.NewField().
-					WithName(fieldContent).
-					WithDataType(entity.FieldTypeVarChar).
-					WithMaxLength(65535).
-					WithEnableAnalyzer(true).
-					WithEnableMatch(true),
-				entity.NewField().
-					WithName(fieldContentSparse).
-					WithDataType(entity.FieldTypeSparseVector),
-				entity.NewField().
-					WithName(fieldSourceID).
+					WithName(fieldSourceID). // 来源标识
 					WithDataType(entity.FieldTypeVarChar).
 					WithMaxLength(255),
 				entity.NewField().
 					WithName(fieldSourceType).
 					WithDataType(entity.FieldTypeInt64),
 				entity.NewField().
-					WithName(fieldChunkID).
+					WithName(fieldChunkID). // 文本块标识
 					WithDataType(entity.FieldTypeVarChar).
 					WithMaxLength(255),
 				entity.NewField().
-					WithName(fieldKnowledgeID).
+					WithName(fieldKnowledgeID). // 知识条目标识
 					WithDataType(entity.FieldTypeVarChar).
 					WithMaxLength(255),
 				entity.NewField().
-					WithName(fieldKnowledgeBaseID).
+					WithName(fieldKnowledgeBaseID). // 知识库标识（多租户隔离）
 					WithDataType(entity.FieldTypeVarChar).
 					WithMaxLength(255),
 				entity.NewField().
-					WithName(fieldTagID).
+					WithName(fieldTagID). // 标签标识
 					WithDataType(entity.FieldTypeVarChar).
 					WithMaxLength(255),
 				entity.NewField().
-					WithName(fieldIsEnabled).
+					WithName(fieldIsEnabled). // 启用状态（软删除）
 					WithDataType(entity.FieldTypeBool),
 			},
 		}
 
+		// 服务端自动计算
+		//  当你向 fieldContent 插入一段文本时，Milvus 服务器内部会自动触发这个函数。
+		//	它会自动对文本进行分词、计算词频（TF）和逆文档频率（IDF），生成一个稀疏向量，并直接填入 fieldContentSparse 字段。
+		//  应用层代码完全不需要调用额外的 NLP 服务来计算稀疏向量。你只管存文本，数据库自动帮你准备好关键词检索能力，这极大地简化了架构。
+		//
 		// Add BM25 function for content sparse vector
 		// ref: https://milvus.io/docs/zh/full-text-search.md
 		schema.WithFunction(entity.NewFunction().
-			WithName("text_bm25_emb").
-			WithInputFields(fieldContent).
-			WithOutputFields(fieldContentSparse).
-			WithType(entity.FunctionTypeBM25))
+			WithName("text_bm25_emb").            // 函数名称
+			WithInputFields(fieldContent).        // 输入字段：content
+			WithOutputFields(fieldContentSparse). // 输出字段：content_sparse
+			WithType(entity.FunctionTypeBM25))    // 函数类型：BM25
+
+		// 稠密向量索引 (fieldEmbedding):
+		//	方式:
+		//		index.NewHNSWIndex(entity.IP, 16, 128):
+		//	算法:
+		//		HNSW (Hierarchical Navigable Small World)。
+		//		这是目前业界公认精度和速度平衡最好的近似最近邻搜索算法。
+		//	度量方式:
+		//		entity.IP (Inner Product, 内积)。
+		//		对于归一化后的向量，内积等价于余弦相似度，适合语义搜索。
+		//	参数:
+		//		M=16 (最大连接数), efConstruction=128 (构建时的搜索范围)。
+		//		这些参数平衡了建库速度和查询精度。
+
+		// 稀疏向量索引 (fieldContentSparse):
+		//	方式:
+		//		index.NewAutoIndex(entity.BM25):
+		//	算法:
+		//		BM25。
+		//		Milvus 针对稀疏向量优化的专用索引，能够极快地计算关键词匹配得分。
+
+		// 标量过滤索引 (Payload Indexes):
+		// 	为所有用于 filter 条件的业务字段建立索引（通常是倒排索引或布隆过滤器）。
+		// 	如果没有这些索引，Milvus 可能需要全表扫描来筛选数据，速度会极慢。
+		// 	有了索引，过滤操作可以在毫秒级完成，确保“先过滤，再搜索”的高效流程。
+		//
+		// 在 Milvus 中，标量过滤索引（Scalar Index） 是确保“带条件向量搜索”高性能的关键。
+		// Milvus 会根据字段的数据类型（Bool, Int, Varchar），自动选择底层最适合的索引算法，Bitmap/Inverted Index 等等。
+
+		// entity.IP 是 Inner Product（内积） 的缩写。
+		// 在向量数据库（如 Milvus）和机器学习中，它是衡量两个向量相似度的一种数学度量方式（Metric Type），值越大越相似。
+		// 当向量被“归一化”（Normalized）后，内积 (IP) 等价于 余弦相似度 (Cosine Similarity)。
+		// 大多数 Embedding 模型（如 OpenAI, BERT）输出的向量通常已经是归一化的，或者我们在存入 Milvus 前会手动归一化。
+		// 因此，直接使用 IP 既能得到和余弦相似度一样的排序结果，又能获得最快的计算速度。
+		//
+		// 对于稠密向量，entity.IP 告诉 HNSW 索引：“请使用内积来计算向量之间的距离，寻找最相似的向量”。
+		// 对于标量字段，entity.IP 仅仅是为了通过编译/接口检查，标量索引（倒排索引、位图索引）根本不计算距离，只做精确或范围匹配，这个参数会被忽略。
 
 		indexOpts := make([]client.CreateIndexOption, 0)
 		// hnsw index for embedding field
@@ -158,6 +362,9 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 			indexOpts = append(indexOpts, client.NewCreateIndexOption(collectionName, fieldName, index.NewAutoIndex(entity.IP)))
 		}
 
+		// 阶段1：创建集合（Create Collection）
+		// 只在磁盘上创建元数据和结构，不可检索
+
 		// Create collection
 		err = m.client.CreateCollection(ctx, client.NewCreateCollectionOption(collectionName, schema).WithIndexOptions(indexOpts...))
 		if err != nil {
@@ -168,11 +375,43 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 		log.Infof("[Milvus] Successfully created collection %s", collectionName)
 	}
 
+	// Milvus 采用存储计算分离架构，“创建集合”不等于“可以搜索”。
+	// 集合创建后默认只存在于对象存储（如 MinIO/S3），查询节点内存中没有数据。
+	//
+	// Milvus 采用 存算分离 和 按需加载 的架构：
+	//	持久化存储 (Disk/Object Storage)：
+	//		当你 Insert 数据或 CreateCollection 时，数据主要保存在磁盘或对象存储（如 AWS S3, MinIO）上。
+	//		此时数据是“冷”的，无法进行高性能向量检索。
+	//	内存计算 (RAM / Query Nodes)：
+	//		向量检索（特别是 HNSW 算法）极度依赖内存随机访问。
+	//		只有将索引结构加载到 Query Node 的内存中，才能实现毫秒级的搜索延迟。
+	//
+	// LoadCollection 把集合数据加载到查询节点的内存中，之后才能执行向量搜索。
+	// LoadCollection 并不无脑全量载入原始数据，而是通过索引压缩、分布式分摊、只加载索引结构以及智能内存管理来实现加载。
+	//
+
+	// 发起加载请求 (非阻塞)
+	//	动作：向 Milvus 服务端发送一个异步指令：“请把 collectionName 这个集合加载到内存中”。
+	//	返回值：任务对象（Task），代表了这次加载操作的句柄。
+	//	状态：此时函数立即返回，不会等待加载完成。因为加载大量数据（尤其是向量索引）可能需要几秒到几分钟，如果阻塞在这里，程序会假死。
+	//	错误：如果连请求都发不出去（比如网络断了、集合不存在、权限不足），err 不为空，直接记录日志并返回错误。
 	loadTask, err := m.client.LoadCollection(ctx, client.NewLoadCollectionOption(collectionName))
 	if err != nil {
 		log.Errorf("[Milvus] Failed to load collection: %v", err)
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
+
+	// 等待加载完成 (阻塞)
+	// 	动作：调用 Await 方法，程序进入阻塞等待状态。
+	//	机制：
+	//		客户端会轮询（Poll）或服务端推送状态，检查 loadTask 的进度。
+	//		Milvus 后台正在做繁重的工作：
+	//		 - 从对象存储（如 MinIO/S3）或本地磁盘读取数据段（Segments）。
+	//		 - 将稠密向量索引（HNSW 图结构）加载到 RAM。
+	//		 - 将稀疏向量索引和标量倒排索引加载到 RAM。
+	//		 - 构建内存中的搜索数据结构。
+	//	完成标志：当所有数据段都成功加载且索引构建完毕，Await 返回 nil，程序继续向下执行。此时集合处于 Loaded 状态，可以立即响应搜索请求。
+	//	超时/失败：如果加载过程中出错（如内存不足 OOM、节点宕机），Await 会返回错误，程序捕获并报错。
 	if err := loadTask.Await(ctx); err != nil {
 		log.Errorf("[Milvus] Failed to await load collection: %v", err)
 		return fmt.Errorf("failed to await load collection: %w", err)
@@ -878,6 +1117,50 @@ func buildRetrieveResult(results []*types.IndexWithScore, retrieverType types.Re
 		},
 	}
 }
+
+// 计算单条向量数据在 Milvus 中占用的总存储空间（字节数）。
+// 它不仅仅计算了原始数据的大小，还估算了索引结构带来的额外开销。
+//
+//
+// Payload 字段（业务数据）
+//	payloadSizeBytes := int64(0)
+//	payloadSizeBytes += int64(len(embedding.Content))         // content string
+//	payloadSizeBytes += int64(len(embedding.SourceID))        // source_id string
+//	payloadSizeBytes += int64(len(embedding.ChunkID))         // chunk_id string
+//	payloadSizeBytes += int64(len(embedding.KnowledgeID))     // knowledge_id string
+//	payloadSizeBytes += int64(len(embedding.KnowledgeBaseID)) // knowledge_base_id string
+//	payloadSizeBytes += 8                                     // source_type int64
+//
+// 向量存储
+//	向量维度：768
+//	每个浮点数：4 字节（float32），Milvus 使用 float32 存储向量
+//	向量大小 = 768 × 4 = 3,072 字节 ≈ 3KB
+//
+//	不同维度的向量大小：
+//	384 维：384 × 4 = 1,536 字节
+//	768 维：768 × 4 = 3,072 字节
+//	1536 维：1536 × 4 = 6,144 字节
+//
+// 索引存储
+// 	IVF (Inverted File) 索引原理：
+// 		1. 将向量空间划分为 nlist 个聚类（cells）
+// 		2. 每个向量分配到最近的聚类中心
+// 		3. 索引存储：每个聚类的中心向量 + 聚类内向量列表
+// 	索引存储公式：
+//		indexBytes = dimensions * (nlist * 4 + 4)
+// 		其中：
+// 			dimensions: 向量维度
+// 			nlist: 聚类数量（默认 16384）
+// 			4: 每个浮点数的字节数
+// 			+4: 每个聚类的额外元数据
+//
+// 元数据
+//	  共 32byte ，包含：
+//		主键 ID
+//		时间戳（创建时间、修改时间）
+//		删除标记
+//		行号映射
+//		其他信息
 
 func (m *milvusRepository) calculateStorageSize(embedding *MilvusVectorEmbedding) int64 {
 	// Payload fields

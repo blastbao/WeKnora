@@ -10,6 +10,72 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// 1. 核心流程：三阶段处理
+//该插件对检索结果进行了三个层面的加工：
+//
+//	第一阶段：空间维度的物理合并 (OnEvent 主逻辑)
+//		分组：按 KnowledgeID（文档 ID）和 ChunkType（类型）将片段归类。
+//		排序与拼接：在同一个文档内，按片段在原书中的位置（StartAt）排序。如果两个片段重叠或相邻，就将它们合并成一个大片段。
+//		图片元数据合并：调用 mergeImageInfo，确保合并后的文本段落依然关联着原来所有小片段里的图片（并自动去重）。
+//	第二阶段：业务维度的内容充实 (populateFAQAnswers)
+//		针对 FAQ 类型：检索回来的可能只是问题的 Embedding，不包含完整的答案。
+//		动作：根据 Chunk ID 去数据库（chunkRepo）拉取完整的标准问答对，并格式化为 Q: ... Answer: ... 的形式。
+//	第三阶段：语义维度的上下文扩展 (expandShortContextWithNeighbors)
+//		触发条件：如果一个文本片段太短（少于 350 字），LLM 可能无法理解其深意。
+//		动作：根据片段记录的 PreChunkID 和 NextChunkID，自动向前后“借”内容，直到长度达标（350-850 字之间）。
+//		智能拼接：使用 concatNoOverlap 算法，自动识别并消除段落衔接处的重复文字。
+
+// 核心功能详解
+//
+//	1. 碎片合并 (Chunk Merging)
+//
+//		在向量检索中，由于切片（Chunking）通常带有重叠区，搜索结果里经常会出现内容高度相似且位置相邻的片段。
+//
+//		逻辑：根据 KnowledgeID（文档ID）分组，并按 StartAt（起始位置）排序。
+//		动作：如果两个片段在原文档中是连续或重叠的，插件会将它们整合成一个长片段。
+//		处理：
+//			如果两个片段不重叠，就保留为两个独立片段。
+//			如果两个片段重叠，代码会把它们“缝合”起来，缝合文字的同时，调用 mergeImageInfo 将两个片段关联的图片信息也合并在一起并去重，确保图片描述不丢失。
+//		结果：
+//			原本可能召回了 10 个乱糟糟的重叠碎片，经过这里处理后，变成了 3-4 个逻辑连贯的完整段落。
+//
+//	2. FAQ 答案补全 (FAQ Enrichment)
+//		向量数据库有时只存储了 FAQ 的问题（以此提高检索匹配率），但是没有答案或者答案不详细。
+//		在向量数据库检索到了一个 ID 为 faq_101 的片段，但知识库里存的可能只是个标题，或者不完整的摘要。
+//
+//		逻辑：识别类型为 ChunkTypeFAQ 的片段。
+//		动作：调用 populateFAQAnswers 根据 ChunkID 去数据库查出完整的标准答案。
+//		逻辑：
+//			插件发现当前片段是 FAQ 类型。
+//			它会拿着这个 ID 去数据库（chunkRepo）里查一遍真正的详细数据。
+//			把数据库里完整的“标准问题”和“标准答案”拼成一个字符串（格式：Q: ... \n A: ...）。
+//		结果：
+//			把检索结果里的占位符，替换成了大模型可以直接阅读的标准问答内容。
+//			利用 buildFAQAnswerContent 将其格式化为清晰的 Q: ... \n Answer: - ... 结构，方便 LLM 阅读。
+//
+//	3. 短文本扩充 (Context Expansion)
+//		有些检索到的片段太短，缺乏足够的语境，导致 LLM 看不懂。
+//
+//		场景：
+//			检索到了一句话：“光合作用释放氧气。”
+//			这句话太短，大模型不知道上下文（是讲植物？还是讲化学方程式？），容易胡说八道。
+//		触发：
+//			片段长度小于 minLen (350字) 且类型为普通文本。
+//		逻辑：
+//			检测：如果片段字数少于 350 个字符（minLen）。
+//			寻找邻居：去数据库里查这个片段的“上一段”（PreChunkID）和“下一段”（NextChunkID）。
+//			拼接：把前文、当前文、后文拼在一起，直到长度接近 850 个字符（maxLen）或者没有邻居为止。
+//			去重：拼接时会检查是否有重叠的字（比如前一段以“是”结尾，后一段以“是”开头），避免出现“释放是是氧气”的错误。
+//			结果：把一句孤立的话，变成了一个包含背景信息的完整段落，极大提升了大模型回答的准确性。
+//		意义：
+//			通过补全前后文，解决了“语义断层”问题，极大提升了模型生成的准确度。
+//
+//	4. 智能去重拼接 (concatNoOverlap)
+//		在合并或扩充时，最怕出现“复读机”现象（即 A 的结尾和 B 的开头重复了）。
+//
+//		实现：concatNoOverlap 函数会计算两个字符串的最大交集。
+//		效果：如果 A 是 “我是中国...”，B 是 “中国心”，它会聪明地拼成 “我是中国心”，而不是 “我是中国中国心”。
+
 // PluginMerge handles merging of search result chunks
 type PluginMerge struct {
 	chunkRepo interfaces.ChunkRepository
@@ -28,6 +94,14 @@ func NewPluginMerge(eventManager *EventManager, chunkRepo interfaces.ChunkReposi
 func (p *PluginMerge) ActivationEvents() []types.EventType {
 	return []types.EventType{types.CHUNK_MERGE}
 }
+
+// OnEvent 处理 CHUNK_MERGE 事件，执行知识片段的物理合并与逻辑增强。
+//
+// 核心逻辑：
+// 1. 物理合并：在同一文档内，根据偏移量 (StartAt/EndAt) 将相邻或重叠的片段合并，减少冗余。
+// 2. 图像整合：合并过程中同步去重并保留所有关联的图片元数据。
+// 3. FAQ 填充：将 FAQ 类型的片段补全为完整的“问-答”结构。
+// 4. 上下文扩展：对过短的文本片段进行邻居节点动态扩展，确保 LLM 获得足够的上下文信息。
 
 // OnEvent processes the CHUNK_MERGE event to merge search result chunks
 func (p *PluginMerge) OnEvent(ctx context.Context,
@@ -72,6 +146,18 @@ func (p *PluginMerge) OnEvent(ctx context.Context,
 	pipelineInfo(ctx, "Merge", "group_summary", map[string]interface{}{
 		"knowledge_cnt": len(knowledgeGroup),
 	})
+
+	// 按 KnowledgeID（文档 ID）和 ChunkType（片段类型）对搜索结果进行双重分组。
+	// 确保只有属于同一份文件且类型相同（如都是文本或都是 FAQ）的片段才会被尝试合并。
+	//
+	// 根据片段在原文档中的起始字符位置 (StartAt) 进行升序排列。
+	//
+	// 如果当前片段的开始位置在最后一个片段的结束位置之后（中间有空隙），说明它们不相邻，直接将其作为独立片段存入结果集。
+	// 如果两个片段存在重叠或刚好相连，执行缝合操作，包括去重（把当前片段中“多出来的部分”粘贴到上一个片段的末尾）、更新 EndAt 指针、合并图片信息。
+	//
+	// 合并后的长片段分值取所有子片段中的最高分，保证即便合并了低分片段，这个“超级片段”在后续排序中依然能凭借其最核心的部分保留高优先级。
+	//
+	// 在每个组内部合并完后，按分值从高到低重新排序，确保发给 LLM 的资料是按相关性排序的，最相关的长片段排在最前面。
 
 	mergedChunks := []*types.SearchResult{}
 	// Process each knowledge source separately
@@ -335,6 +421,10 @@ func buildFAQAnswerContent(meta *types.FAQChunkMetadata) string {
 
 	return strings.TrimSpace(builder.String())
 }
+
+// expandShortContextWithNeighbors 实现了一种“滑动窗口”式的动态扩展机制。
+// 它通过双向链表结构 (Pre/Next ID) 递归拉取相邻 Chunk，直至片段长度满足配置要求，
+// 极大地缓解了 RAG 系统中常见的“断章取义”问题。
 
 // expandShortContextWithNeighbors expands the short context with neighbors
 func (p *PluginMerge) expandShortContextWithNeighbors(

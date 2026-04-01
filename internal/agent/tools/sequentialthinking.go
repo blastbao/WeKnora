@@ -15,7 +15,7 @@ import (
 
 // 通常 AI 是直接输出答案的，但对于复杂问题（如架构设计、多步故障排除），直接输出容易出错。
 // 这个工具允许 AI 在执行动作前，先进行显式的、可修正的思考。
-// 其核心逻辑是 Chain of Thought (思维链) 的工程化实现。
+// 其是 Chain of Thought (思维链) 的工程化实现。
 
 // SequentialThinkingInput 不仅仅是一个简单的输入包，它是一个状态机控制器。
 //	通过 ThoughtNumber/TotalThoughts 管理进度。

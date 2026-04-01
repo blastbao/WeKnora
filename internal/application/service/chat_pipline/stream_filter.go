@@ -11,6 +11,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// PluginStreamFilter 实现聊天管道中的流式过滤功能
+//
+// 该插件用于拦截和处理模型生成的流式响应，支持基于前缀的过滤策略。
+// 当检测到响应以特定前缀开头时，可以阻止该响应继续传递，并触发降级回复。
+
 // PluginStreamFilter implements stream filtering functionality for chat pipeline
 type PluginStreamFilter struct{}
 
@@ -25,6 +30,19 @@ func NewPluginStreamFilter(eventManager *EventManager) *PluginStreamFilter {
 func (p *PluginStreamFilter) ActivationEvents() []types.EventType {
 	return []types.EventType{types.STREAM_FILTER}
 }
+
+// OnEvent 用于拦截和校验模型生成的流式响应内容。
+// 该函数是插件的入口点，负责检查是否需要启用前缀过滤，并协调过滤逻辑。
+//
+// 处理逻辑:
+//  1. 检查EventBus是否存在，不存在则返回错误
+//  2. 检查SummaryConfig.NoMatchPrefix是否配置，决定是否启用过滤
+//  3. 若启用过滤，调用filterEventsWithPrefix进行拦截处理
+//  4. 若未启用过滤，直接调用next()透传
+//
+// 配置说明:
+//   - SummaryConfig.NoMatchPrefix: 不匹配前缀，当响应以此前缀开头时需要过滤
+//   - EventBus: 事件总线，用于接收和发送流式事件
 
 // OnEvent handles stream filtering events in the chat pipeline
 func (p *PluginStreamFilter) OnEvent(ctx context.Context,

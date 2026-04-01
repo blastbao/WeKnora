@@ -35,6 +35,20 @@ func (p *PluginChatCompletionStream) ActivationEvents() []types.EventType {
 	return []types.EventType{types.CHAT_COMPLETION_STREAM}
 }
 
+// OnEvent 处理流式聊天完成事件
+// 该函数负责启动大模型的流式推理任务，并利用事件总线（EventBus）将大模型的流式输出异步转发至客户端。
+// 对于具备推理能力（Reasoning）的模型，它自动在思考内容前后插入 <think> 标签，确保前端能正确渲染思考过程与最终回答。
+//
+// 主要执行流程:
+//   - 输入审计: 记录会话ID、用户问题等关键入参。
+//   - 模型准备: 获取模型实例及推理参数配置。
+//   - 上下文构建: 组装包含系统提示词和历史对话的消息列表。
+//   - 流式调用: 发起流式推理请求，获取响应通道。
+//   - 异步转发: 启动协程循环读取模型的响应数据：
+//     - 异常处理：若收到 ResponseTypeError，向总线发送错误事件。
+//     - 思考内容包装：若收到 ResponseTypeThinking，自动包裹 <think> 标签并实时推送到总线。
+//     - 正式回答推送：若收到 ResponseTypeAnswer，确保思考标签闭合后，将回答片段推送至总线。
+
 // OnEvent handles streaming chat completion events
 // It prepares the chat model, messages, and initiates streaming response
 func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,

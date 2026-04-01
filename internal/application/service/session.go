@@ -432,6 +432,114 @@ func (s *sessionService) GenerateTitleAsync(
 	}()
 }
 
+// KnowledgeQA 执行基于知识库的问答，通过 LLM 对检索结果进行总结生成答案。
+//
+//【核心功能】
+// 该函数负责协调用户查询、知识库检索策略、模型配置及上下文管理，最终启动异步事件流水线来生成流式回答。
+// 它充当“调度员”角色，根据请求参数和自定义 Agent 配置动态决定：
+//  1. 检索范围：是仅搜索用户明确指定的知识库，还是使用 Agent 默认绑定的库，亦或是禁用检索（纯聊天）。
+//  2. 运行配置：合并全局默认值、Agent 特化配置（如温度、Prompt、TopK）及请求级覆盖参数。
+//  3. 执行路径：根据是否命中知识库或开启联网搜索，智能路由到 "rag_stream" (检索增强) 或 "chat_stream" (纯对话) 流水线。
+//
+//【配置优先级逻辑】
+// 参数生效顺序严格遵循：请求显式参数 > CustomAgent 配置 > 系统全局默认值 (config.yaml)。
+// 特别是知识库选择：若用户通过 @mention 显式指定了 KB/文档，将忽略 Agent 的默认配置；
+// 若未指定且 Agent 开启了 "RetrieveKBOnlyWhenMentioned"，则强制降级为纯聊天模式。
+//
+// 【事件驱动与副作用】
+// 本函数本身不直接返回生成的文本，而是通过 eventBus 异步发射以下事件供前端消费：
+// - event.EventAgentReferences: 当检索到相关文档时，发送引用来源列表。
+// - event.EventAgentAnswerChunk: (由下游 pipeline 触发) 流式发送回答片段。
+// - event.EventAgentCompletion: (由下游 pipeline 触发) 标记回答结束。
+//
+//【参数说明】
+//   - ctx: 上下文，包含租户ID、用户ID等信息。
+//   - session: 当前会话对象，包含会话ID、租户ID等信息。
+//   - query: 用户输入的查询文本。
+//   - knowledgeBaseIDs: [可选] 用户显式指定的知识库ID列表 (@KB)。优先级最高。
+//   - knowledgeIDs: [可选] 用户显式指定的具体文档ID列表 (@Doc)。优先级最高。
+//   - assistantMessageID: 助手消息ID，用于在 pipeline 中关联消息事件。
+//   - summaryModelID: [可选] 请求级指定使用的摘要模型ID，为空时使用默认或 CustomAgent 配置。
+//   - webSearchEnabled: 是否启用联网搜索（将搜索引擎结果作为知识来源）。若为 true 且无本地知识库，将触发纯联网检索流程。
+//   - eventBus: 事件总线，用于向客户端异步的推送答案块、参考资料等事件。
+//   - customAgent: [可选] 自定义 Agent 配置。若提供，将覆盖全局默认参数，包括模型、提示词、温度、检索参数、多轮对话设置等。
+//   - enableMemory: 是否启用长期记忆（将对话内容存入记忆库供后续参考）。若为 false，将忽略历史上下文。
+//
+// 【返回值】
+//   - error: 若在参数解析、配置合并或流水线启动阶段发生致命错误则返回 err；
+//            若成功启动流水线（即使后续生成失败），通常返回 nil（具体错误通过事件流或日志上报）。
+//
+// 执行流程：
+//  1. 确定检索范围（知识库/文档）：
+//    - 检查请求中是否包含显式的 knowledgeBaseIDs 或 knowledgeIDs。
+//    - 若有显式指定：直接使用，忽略 Agent 配置。
+//    - 若无显式指定：检查 Agent 配置中的 RetrieveKBOnlyWhenMentioned 标志。
+//      - 若为 true：清空知识库列表（强制纯聊天）。
+//      - 若为 false：加载 Agent 默认绑定的知识库列表。
+//  2. 选择对话模型：
+//    - 确定 Chat Model ID：优先级 summaryModelID > CustomAgent.ModelID > 会话默认模型。
+//    - 构建 SummaryConfig：将 Agent 中的 SystemPrompt, Temperature, ContextTemplate 等参数覆盖到全局默认配置中。
+//    - 更新检索参数：应用 Agent 特定的 EmbeddingTopK, RerankThreshold, VectorThreshold 等微调参数。
+//    - 处理多轮记忆：根据 Agent 的 MultiTurnEnabled 和 HistoryTurns 设置 maxRounds，决定是否携带历史上下文。
+//  3. 上下文环境构建 (Context Building):
+//    - 确定检索租户范围 (retrievalTenantID)：优先使用 Agent 所属租户，否则回退到 Session 租户或 Context 中的租户。
+//    - 构建统一的搜索目标列表 (searchTargets)，用于后续 pipeline 的快速查找。
+//  4. 构建 ChatManage 对象：
+//     - 实例化 types.ChatManage 结构体，封装所有问答所需的参数（查询文本、检索配置、模型配置、FAQ策略等）
+//     - 注入 EventBus 接口，确保下游 pipeline 能直接发射事件。
+//  5. 流水线路由决策：
+//    - 判断条件：(无本地知识库) AND (无联网搜索)？
+//      - 是 (纯聊天)：
+//        - 若 maxRounds > 0：选择 "chat_history_stream" (带记忆的纯聊)。
+//        - 若 maxRounds = 0：选择 "chat_stream" (单次纯聊)。
+//      - 否 (RAG/联网)：
+//        - 统一选择 "rag_stream" 流水线（该流水线内部会自动处理 KB 检索、重排序、联网搜索及最终生成）。
+//  6. 通过 KnowledgeQAByEvent 执行实际的事件处理流程
+//  7. 若存在检索结果，发送 EventAgentReferences 事件供前端展示参考资料
+//
+// 支持的特性：
+//   - 多知识库检索：支持同时从多个知识库中检索
+//   - 精准文档定位：支持指定具体文档ID进行检索
+//   - 自定义助手覆盖：CustomAgent 可覆盖系统默认的所有配置项
+//   - FAQ 优先级策略：FAQ 匹配度高于阈值时可直接返回答案
+//   - 联网搜索：可与知识库检索并行或单独使用
+//   - 多轮对话：根据配置保留对话历史上下文
+//   - 查询改写：可启用 query rewrite 优化检索效果
+//   - 查询扩展：可启用 query expansion 增加召回率
+//   - 长期记忆：可启用 memory 功能记录用户偏好和历史
+//
+// 使用示例：
+//   // 创建事件总线
+//   eventBus := event.NewEventBus()
+//
+//   // 执行问答
+//   err := sessionService.KnowledgeQA(
+//       ctx,
+//       session,
+//       "向量数据库是什么？",
+//       []string{"kb-123"},            // 知识库ID
+//       nil,                           // 无指定文档
+//       msgID,
+//       "",                            // 使用默认模型
+//       false,                         // 不启用联网搜索
+//       eventBus,
+//       customAgent,                   // 可选的自定义助手
+//       true,                          // 启用长期记忆
+//   )
+//
+//   // 通过 eventBus 监听答案事件
+//   eventBus.On(event.EventAgentMessageChunk, func(e event.Event) {
+//       data := e.Data.(event.AgentMessageChunkData)
+//       fmt.Print(data.Chunk) // 逐块输出答案
+//   })
+//
+// 注意事项：
+//   - 本方法为异步设计，答案通过 EventBus 返回，不阻塞等待
+//   - CustomAgent 的 MultiTurnEnabled 为 false 时会清空历史上下文
+//   - 当 RetrieveKBOnlyWhenMentioned 为 true 且用户无 @提及 时，不会检索任何知识库
+//   - FAQ 优先级策略需要知识库中包含 FAQ 类型的知识条目
+//   - 联网搜索需要在系统配置中启用并配置搜索引擎
+
 // KnowledgeQA performs knowledge base question answering with LLM summarization
 // Events are emitted through eventBus (references, answer chunks, completion)
 // customAgent is optional - if provided, uses custom agent configuration for multiTurnEnabled and historyTurns
@@ -861,6 +969,26 @@ func (s *sessionService) selectChatModelID(
 	return "", errors.New("no chat model ID available: no knowledge bases configured and no available models")
 }
 
+// resolveKnowledgeBasesFromAgent 根据智能体（Agent）的配置策略，解析并返回当前会话应加载的知识库 ID 列表。
+//
+// 该函数依据 customAgent.Config.KBSelectionMode 字段决定加载策略：
+//   - "all" (全量模式): 自动获取当前租户下的所有自有知识库，并合并当前用户有权限访问的共享知识库。内部会自动进行去重处理，确保 ID 唯一。
+//   - "selected" (指定模式): 仅返回配置中显式指定的知识库 ID 列表。
+//   - "none" (禁用模式): 返回 nil，表示不加载任何知识库。
+//   - 默认/未设置: 为了向后兼容，行为降级为 "selected" 模式，使用配置中指定的列表（若有）。
+//
+// 容错机制:
+//   - 若 customAgent 为 nil，直接返回 nil。
+//   - 在 "all" 模式下，若获取自有或共享知识库列表失败，仅记录警告日志 (Warn)，并返回已成功获取的部分数据，避免因依赖服务异常导致整个请求中断（尽力而为策略）。
+//   - 自动处理上下文中的 TenantID 和 UserID，若缺失或类型断言失败可能导致 panic (建议调用前确保上下文完整)。
+//
+// 参数:
+//   - ctx: 上下文对象，用于传递链路追踪信息、租户 ID (TenantID) 及用户 ID (UserID)。
+//   - customAgent: 自定义智能体配置对象，包含知识库选择模式及预配置的知识库列表。
+//
+// 返回:
+//   - []string: 解析后的知识库 ID 切片。若模式为 "none" 或发生严重前置错误，可能返回 nil。
+
 // resolveKnowledgeBasesFromAgent resolves knowledge base IDs based on agent's KBSelectionMode
 // Returns the resolved knowledge base IDs based on the selection mode:
 //   - "all": fetches all knowledge bases for the tenant
@@ -925,6 +1053,28 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 	}
 }
 
+// configureSkillsFromAgent 根据 CustomAgent 的配置，初始化 AgentConfig 中的技能（Skills）相关参数。
+//
+// 支持的 SkillsSelectionMode：
+//   - "all": 启用所有预加载技能（SkillDirs 指向默认目录）
+//   - "selected": 仅启用 CustomAgent 中显式选中的技能
+//   - "none" 或 "": 禁用技能
+//   - 其他值: 未知模式，默认禁用技能并记录 warning
+//
+// 特殊规则：
+//   - 当沙箱模式（WEKNORA_SANDBOX_MODE）被禁用或为 "disabled" 时，无论选择模式如何，技能都会被强制禁用
+//
+// 参数：
+//   - ctx: 上下文，用于日志记录和上下文传递
+//   - agentConfig: 要填充的 Agent 配置（会被直接修改）
+//   - customAgent: 自定义 Agent 配置来源
+//
+// 说明：
+//   - 该函数无返回值，所有配置结果直接写入 agentConfig
+//   - 若 customAgent 为 nil，函数直接返回
+//   - AllowedSkills 为空时表示允许所有技能
+//   - 每个分支都会记录对应的 info / warn 日志，便于排查
+
 // configureSkillsFromAgent configures skills settings in AgentConfig based on CustomAgentConfig
 // Returns the skill directories and allowed skills based on the selection mode:
 //   - "all": uses all preloaded skills
@@ -978,6 +1128,40 @@ func (s *sessionService) configureSkillsFromAgent(
 	}
 
 }
+
+// buildSearchTargets 构建统一的搜索目标列表（SearchTargets），将知识库 ID 和知识条目 ID 转换为结构化的搜索目标。
+// 它负责解析每个目标的实际租户归属（TenantID），处理自有、组织共享及跨租户共享（通过 Agent）的权限逻辑。
+//
+// 该函数在请求入口处调用一次，将知识库列表和知识条目列表统一转换为 SearchTargets 结构，
+// 避免在后续处理流程中重复查询和解析，提升性能并统一权限控制逻辑。
+
+// 构建逻辑：
+//   - 处理知识库，对于每个 knowledgeBaseID：
+//     * 解析其真实 TenantID（自身 KB / 组织共享 KB / 共享 Agent 场景下的检索租户）
+//     * 若用户对该 KB 有访问权限，则使用 KB 原始 TenantID
+//     * 否则退回到传入的 tenantID
+//     * 生成类型为 `SearchTargetTypeKnowledgeBase` 的的搜索目标，标识着搜索整个知识库
+//   - 处理知识，对于每个 knowledgeID：
+//     * 找到其所属 KnowledgeBaseID
+//     * 若该 KB 已被整体加入搜索目标，则跳过
+//     * 否则生成一个 SearchTargetTypeKnowledge 类型的搜索目标，标识着搜索指定知识
+//
+// 参数:
+//   - ctx: 上下文，包含租户 ID、用户 ID 等权限验证信息
+//   - tenantID: 租户 ID，通常为当前会话的租户 ID 或共享 Agent 的有效租户
+//   - knowledgeBaseIDs: 需要搜索的知识库 ID 列表（完整搜索）
+//   - knowledgeIDs: 需要搜索的知识条目 ID 列表（限定在特定文件/知识内搜索）
+//
+// 返回:
+//   - targets: 构建好的搜索目标列表，包含知识库级别和知识条目级别的搜索目标
+//   - error: 执行错误（当前实现中即使出错也倾向于返回部分结果，error 通常为 nil）
+//
+// 注意事项:
+//   - 租户 ID 由调用方（handler）根据会话或共享 Agent 设置，函数内部不修改租户范围
+//   - 知识库访问权限通过 knowledgeBaseService 和 kbShareService 双重验证
+//   - 知识条目获取使用 GetKnowledgeBatchWithSharedAccess，自动处理共享权限
+//   - 已标记为完整搜索的知识库，其下的知识条目会被跳过，避免重复搜索
+//   - 知识条目获取失败时只记录警告，返回已构建的目标（部分成功）
 
 // buildSearchTargets computes the unified search targets from knowledgeBaseIDs and knowledgeIDs.
 // tenantID is the retrieval scope: session.TenantID or effective tenant from shared agent (set by handler).
@@ -1081,9 +1265,91 @@ func (s *sessionService) buildSearchTargets(
 	return targets, nil
 }
 
+// KnowledgeQAByEvent 通过事件管道处理知识库问答流程
+//
+// 该函数是会话服务的核心入口之一，负责将用户的查询请求转化为一系列有序的事件处理步骤。
+// 它通过调用 `eventManager` 依次触发配置好的事件链（如：意图识别、检索增强、答案生成等），
+// 并根据执行结果进行相应的错误处理或降级响应。
+//
+// 这种事件驱动的流水线模式，将复杂的问答流程分解为多个可独立执行的步骤，实现高内聚低耦合的处理架构。
+//
+//
+// 核心流程：
+// 1. 链路追踪与日志初始化：
+//    - 创建新的 Span 以记录整个 QA 过程的性能指标。
+//    - 记录关键参数（SessionID, Query）及即将触发的事件列表。
+//
+// 2. 顺序事件执行：
+//    - 遍历 `eventList`，依次调用 `s.eventManager.Trigger` 处理每个事件。
+//    - 每个事件都会接收并可能修改 `chatManage` 对象（作为上下文载体）。
+//
+// 3. 异常与降级处理：
+//    - 如果某个事件返回"搜索无结果"错误(ErrSearchNothing): 返回此错误，视为“未找到相关知识”。
+//      系统将立即触发 `handleFallbackResponse`（兜底回复策略，如通用回答或引导语），并正常结束流程（返回 nil）。
+//    - 其他错误: 记录详细错误日志（类型、描述、原始错误），更新 Span 状态为 Error，并直接返回原始错误对象，中断后续事件执行。
+//
+// 4. 成功完成：
+//    - 若所有事件均成功执行，记录成功日志并返回 nil。
+//
+// 参数:
+//   - ctx: 上下文对象，包含链路追踪信息、RequestID 及用户身份等。
+//   - chatManage: 聊天管理对象，携带会话状态、用户查询 (Query)、会话 ID 及兜底策略配置。该对象在事件链中会被各处理器修改（如填入检索结果、生成的回答等）。
+//   - eventList: 需要触发的事件类型列表，定义了 QA 的处理流水线顺序，按序执行（如: [REWRITE_QUERY, SEARCH, RERANK, GENERATE]）
+//
+// 返回:
+//   - error: 错误信息，可能的情况包括:
+//     - 搜索无结果时返回 nil（已通过兜底响应处理）
+//     - 事件处理失败时返回具体的错误（如检索服务异常、生成服务超时等）
+//
+// 说明：
+//   - 该函数通常用于知识库问答的主流程入口
+//   - 事件列表由上层根据 Agent / Session 配置决定
+//   - 所有关键节点均有日志和 tracing 记录，便于问题排查
+//
+// 事件类型示例:
+//   - REWRITE_QUERY: 查询重写，优化用户输入
+//   - SEARCH: 向量检索，从知识库中检索相关内容
+//   - RERANK: 重排序，优化检索结果排序
+//   - GENERATE: 生成回答，基于检索结果生成最终答案
+//   - FILTER: 过滤，过滤不符合条件的检索结果
+//
+// 注意事项:
+//   - 事件按顺序执行，前一个事件的结果会影响后续事件的处理
+//   - 搜索无结果时不会中断流程，而是触发兜底响应（如返回默认回复或建议）
+//   - 所有事件通过 eventManager 统一管理，支持事件插拔和动态配置
+//   - 使用 OpenTelemetry 进行链路追踪，便于监控和问题排查
+
+// 用户查询: "什么是向量数据库？"
+//					   ↓
+//	┌─────────────────────────────────────────────────────────────┐
+//	│              事件管道顺序执行                                  │
+//	├─────────────────────────────────────────────────────────────┤
+//	│                                                             │
+//	│  Event 1: REWRITE_QUERY                                     │
+//	│  ├─ 输入: "什么是向量数据库？"                                  │
+//	│  └─ 输出: 优化后的查询语句（可选项）                             │
+//	│                    ↓                                        │
+//	│  Event 2: SEARCH                                            │
+//	│  ├─ 输入: 优化后的查询                                         │
+//	│  └─ 输出: 检索到的相关文档列表（3-5 条）                         │
+//	│                    ↓                                        │
+//	│  Event 3: RERANK                                            │
+//	│  ├─ 输入: 原始检索结果                                         │
+//	│  └─ 输出: 重排序后的文档列表（提高相关性）                        │
+//	│                    ↓                                        │
+//	│  Event 4: GENERATE                                          │
+//	│  ├─ 输入: 重排序后的文档 + 原始查询                              │
+//	│  └─ 输出: 最终生成的回答 + 引用来源                             │
+//	│                                                             │
+//	└─────────────────────────────────────────────────────────────┘
+//					   ↓
+//	最终回答: "向量数据库是一种专门用于存储和检索向量嵌入的数据库..."
+
 // KnowledgeQAByEvent processes knowledge QA through a series of events in the pipeline
-func (s *sessionService) KnowledgeQAByEvent(ctx context.Context,
-	chatManage *types.ChatManage, eventList []types.EventType,
+func (s *sessionService) KnowledgeQAByEvent(
+	ctx context.Context,
+	chatManage *types.ChatManage,
+	eventList []types.EventType,
 ) error {
 	ctx, span := tracing.ContextWithSpan(ctx, "SessionService.KnowledgeQAByEvent")
 	defer span.End()

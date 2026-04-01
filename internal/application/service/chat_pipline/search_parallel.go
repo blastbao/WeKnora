@@ -85,6 +85,24 @@ func (p *PluginSearchParallel) ActivationEvents() []types.EventType {
 	return []types.EventType{types.CHUNK_SEARCH_PARALLEL}
 }
 
+// OnEvent 并行执行文本块检索与实体检索，旨在通过并发处理降低整体搜索延迟。
+// 该函数作为混合检索的调度器，同时启动常规搜索插件和实体搜索插件，并在最后合并、去重结果。
+//
+// 执行流程详解：
+// 1. 上下文隔离：
+//    - 创建两份 chatManage 的副本（chunkChatManage, entityChatManage），分别用于两个并行的搜索任务。
+//    - 清空副本中的 SearchResult，防止并发写入导致的数据竞争。
+// 2. 并发执行：
+//    - 启动 Goroutine 1：执行常规文本块检索（searchPlugin）。
+//    - 启动 Goroutine 2：执行实体图谱检索（searchEntityPlugin）。若无实体词则自动跳过。
+//    - 使用 sync.WaitGroup 等待两个任务完成。
+// 3. 结果合并与去重：
+//    - 等待所有协程结束后，将两个副本中的结果合并至主 chatManage.SearchResult。
+//    - 调用 removeDuplicateResults 剔除重复项（基于 ID 和内容指纹）。
+// 4. 容错处理：
+//    - 记录搜索过程中的错误，但若至少有一个搜索成功返回结果，则不中断流程。
+//    - 仅当两个搜索均失败或无结果时，才返回错误。
+
 // OnEvent handles parallel search events - runs chunk search and entity search concurrently
 func (p *PluginSearchParallel) OnEvent(ctx context.Context,
 	eventType types.EventType, chatManage *types.ChatManage, next func() *PluginError,

@@ -10,6 +10,38 @@ import (
 	"gorm.io/gorm"
 )
 
+// CREATE TABLE knowledges (
+//    id VARCHAR(36) PRIMARY KEY,                 -- 主键：全局唯一 UUID，标识单个知识条目（可能是文件、网页或手动录入的文本块）
+//    tenant_id INT NOT NULL,                     -- 租户 ID：核心隔离字段，确保数据归属正确
+//    knowledge_base_id VARCHAR(36) NOT NULL,     -- 所属知识库 ID：逻辑分组标识。多个 `knowledges` (如多个文件) 可归属于同一个 `knowledge_base`
+//
+//    type VARCHAR(50) NOT NULL,                  -- 知识类型：枚举值，如 'file' (文件), 'url' (网页), 'text' (手动文本), 'faq_import' (FAQ导入)
+//    title VARCHAR(255) NOT NULL,                -- 标题：知识的显示名称。对于文件通常是文件名，对于网页是页面标题
+//    description TEXT,                           -- 描述：用户对知识的备注或自动生成的摘要，用于检索增强或展示
+//
+//    source VARCHAR(128) NOT NULL,               -- 来源标识：具体来源路径或标识。如本地上传标记为 'local_upload'，URL 则存链接地址
+//    parse_status VARCHAR(50) NOT NULL DEFAULT 'unprocessed', 	-- 解析状态：生命周期状态。
+//                                                              -- 枚举：'unprocessed' (待处理), 'parsing' (解析中), 'parsed' (解析完成), 'failed' (失败)
+//    enable_status VARCHAR(50) NOT NULL DEFAULT 'enabled',    	-- 启用状态：控制该知识是否参与检索。
+//                                                              -- 枚举：'enabled' (启用), 'disabled' (禁用/暂停), 'archived' (归档)
+//    embedding_model_id VARCHAR(64),             -- 向量化模型 ID：记录该知识使用哪个 Embedding 模型生成的向量。模型变更时需重新向量化
+//    processed_at TIMESTAMP,                     -- 处理完成时间：记录解析和向量化成功的时间点，用于统计耗时
+//    error_message TEXT,                         -- 错误信息：当 `parse_status`='failed' 时，存储具体的报错堆栈或原因，便于排查
+//
+//    file_name VARCHAR(255),                     -- 原始文件名：保留用户上传时的原始名称（含扩展名）
+//    file_type VARCHAR(50),                      -- 文件 MIME 类型/扩展名：如 'pdf', 'md', 'docx'。决定使用哪种解析器
+//    file_size BIGINT,                           -- 文件大小 (字节)：上传时的原始大小
+//    file_path TEXT,                             -- 存储路径：对象存储 (OSS/S3) 的路径或本地文件系统路径
+//    file_hash VARCHAR(64),                      -- 文件内容哈希：SHA256 值。用于秒传检测（相同文件不重复上传）和去重
+//    storage_size BIGINT NOT NULL DEFAULT 0,     -- 实际占用存储：解析后产生的切片、图片等所有关联资源的总大小（可能大于原文件）
+//
+//    metadata JSON,                              -- 扩展元数据：存储动态字段。
+//                                                -- 示例：
+//                                                -- - URL 类型： { "crawl_depth": 1, "domain": "example.com" }
+//                                                -- - 文件类型：  { "page_count": 10, "author": "John" }
+//                                                -- - 自定义标签：{ "tags": ["HR", "Policy"] }
+//) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 var ErrKnowledgeNotFound = errors.New("knowledge not found")
 
 // omitFieldsOnUpdate defines fields to omit when updating knowledge

@@ -67,6 +67,17 @@ func EscapeHTML(input string) string {
 	return html.EscapeString(input)
 }
 
+// ValidateInput 实施多层安全校验与数据清洗，确保用户原始查询的合法性。
+//
+// 该函数通过以下四道防线防范注入攻击与异常数据：
+// 1. 基础校验：拦截空输入并处理特殊业务逻辑。
+// 2. 字符过滤：严格限制 ASCII 控制字符（允许 Tab/换行/回车），防止不可见字符绕过审计。
+// 3. 编码合规：强制执行 UTF-8 有效性检查，规避利用非法字节序列诱发的解析错误。
+// 4. 攻击扫描：基于预定义的正则模式（xssPatterns）检测并拦截潜在的 XSS 脚本及 Prompt 注入攻击。
+//
+// 成功通过校验后，函数将返回经过首尾去噪（TrimSpace）的清洁字符串。
+// 若校验失败（返回 false），调用者应中断处理并触发安全告警。
+
 // ValidateInput 验证用户输入
 func ValidateInput(input string) (string, bool) {
 	if input == "" {

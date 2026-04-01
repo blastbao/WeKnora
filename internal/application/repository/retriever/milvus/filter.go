@@ -61,6 +61,32 @@ var comparisonOperators = map[string]string{
 	operatorNotLike:            "not like",
 }
 
+// 实现了一个通用的过滤器转换器，将业务层定义的、结构化的过滤条件，
+// 递归地转换为 Milvus 数据库可执行的表达式字符串以及对应的参数映射表。
+//
+// 这种设计通常用于支持参数化查询，既能防止 SQL/Expr 注入攻击，又能处理复杂的数据类型（如时间、特殊字符）。
+//
+// 举例：
+//
+// 业务层构造通用条件树：
+//	cond := &universalFilterCondition{
+//    Operator: "and",
+//    Value: []*universalFilterCondition{
+//        {Field: "knowledge_base_id", Operator: "eq", Value: "kb_123"},
+//        {Field: "is_enabled", Operator: "eq", Value: true},
+//        {Field: "tag_id", Operator: "in", Value: []string{"tag1", "tag2"}},
+//    },
+//	}
+//
+// 转换后得到：
+//
+// 	exprStr: "(knowledge_base_id == {knowledge_base_id_1}) and (is_enabled == {is_enabled_2}) and (tag_id in {tag_id_3})"
+//	params: map[string]any{
+//	   "knowledge_base_id_1": "kb_123",
+//	   "is_enabled_2": true,
+//	   "tag_id_3": []string{"tag1", "tag2"},
+//	}
+
 type convertResult struct {
 	exprStr string
 	params  map[string]any
@@ -238,11 +264,28 @@ func (c *filter) convertParamName(field string, counter *int) string {
 	return fmt.Sprintf("%s_%d", strings.ReplaceAll(field, ".", "_"), *counter)
 }
 
+// 结构说明
+//
+//	Field: 字段名（如 source_id, create_time）。
+//	Operator: 操作符（eq, gt, and, or, in, between 等）。
+//	Value:
+//	 - 对于比较操作（eq, gt）：是具体的值（字符串、数字等）。
+//	 - 对于逻辑操作（and, or）：是一个子条件切片 []*universalFilterCondition。
+//	 - 对于集合操作（in）：是一个切片。
+//	 - 对于范围操作（between）：是一个包含两个元素的切片 [min, max]。
+
 type universalFilterCondition struct {
 	Field    string `json:"field,omitempty" jsonschema:"description=The metadata field to filter on (required for comparison operators)"`
 	Operator string `json:"operator" jsonschema:"description=The operator to use,enum=eq,enum=ne,enum=gt,enum=gte,enum=lt,enum=lte,enum=in,enum=not in,enum=like,enum=not like,enum=between,enum=and,enum=or"`
 	Value    any    `json:"value,omitempty" jsonschema:"description=The value to compare against (for comparison operators) or array of sub-conditions (for logical operators and/or)"`
 }
+
+// JSON 解析
+//	自动递归：
+// 		当检测到操作符是 and 或 or 时，它会自动将 JSON 中的 value 数组反序列化为 []*universalFilterCondition。
+//		这使得前端或调用方可以传入无限嵌套的 JSON 结构，而无需手动处理类型断言。
+//	大小写不敏感：
+//		自动将操作符转为小写 (strings.ToLower)，兼容多种输入风格。
 
 func (c *universalFilterCondition) UnmarshalJSON(data []byte) error {
 	type Alias struct {

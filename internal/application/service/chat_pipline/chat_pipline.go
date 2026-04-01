@@ -52,7 +52,9 @@ func (e *EventManager) Register(plugin Plugin) {
 
 // buildHandler constructs a handler chain for the given plugins
 func (e *EventManager) buildHandler(plugins []Plugin) func(
-	ctx context.Context, eventType types.EventType, chatManage *types.ChatManage,
+	ctx context.Context,
+	eventType types.EventType,
+	chatManage *types.ChatManage,
 ) *PluginError {
 	next := func(context.Context, types.EventType, *types.ChatManage) *PluginError { return nil }
 	for i := len(plugins) - 1; i >= 0; i-- {
@@ -69,7 +71,8 @@ func (e *EventManager) buildHandler(plugins []Plugin) func(
 
 // Trigger invokes the handler for the specified event type
 func (e *EventManager) Trigger(ctx context.Context,
-	eventType types.EventType, chatManage *types.ChatManage,
+	eventType types.EventType,
+	chatManage *types.ChatManage,
 ) *PluginError {
 	if handler, ok := e.handlers[eventType]; ok {
 		return handler(ctx, eventType, chatManage)

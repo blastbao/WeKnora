@@ -12,6 +12,34 @@ import (
 	"gorm.io/gorm"
 )
 
+// CREATE TABLE chunks (
+//
+//    id VARCHAR(36) PRIMARY KEY,                 -- 主键：全局唯一 UUID，用于精确检索和关联
+//    tenant_id INTEGER NOT NULL,                 -- 租户 ID：核心隔离字段，确保数据多租户安全
+//    knowledge_base_id VARCHAR(36) NOT NULL,     -- 知识库 ID
+//    knowledge_id VARCHAR(36) NOT NULL,          -- 知识 ID
+//
+//    content TEXT NOT NULL,                      -- 切片正文：实际文本内容。注意：此处存储的是截取后的片段
+//    chunk_index INTEGER NOT NULL,               -- 切片索引：当前知识库内的逻辑排序号 (0, 1, 2...)。用于前端按序展示，删除中间节点后需重排
+//    start_at INTEGER NOT NULL,                  -- 起始偏移量：该切片内容在【原始完整文档】中的起始字符位置 (0-based)
+//    end_at INTEGER NOT NULL,                    -- 结束偏移量：该切片内容在【原始完整文档】中的结束字符位置 (独占区间)
+//                                                -- 用途：结合 start_at/end_at 可无需存储全文即可从原文动态还原任意切片，或高亮显示原文位置
+//
+//    pre_chunk_id VARCHAR(36),                   -- 前驱切片 ID：指向逻辑顺序上的上一个 Chunk。用于快速向前遍历，无需依赖 index 排序
+//    next_chunk_id VARCHAR(36),                  -- 后继切片 ID：指向逻辑顺序上的下一个 Chunk。用于快速向后遍历，构建上下文窗口 (Context Window)
+//                                                -- 优势：即使 chunk_index 变更或删除中间节点，只需调整指针即可，比重新排序所有 index 更高效
+//
+//    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,   		-- 启用开关：false 表示该切片被禁用 (如用户手动排除)，检索时通常过滤掉
+//    chunk_type VARCHAR(20) NOT NULL DEFAULT 'text', 	-- 类型枚举：'text' (普通文本), 'faq' (问答), 'table' (表格) 等。决定解析和检索策略
+//    parent_chunk_id VARCHAR(36),                		-- 父切片 ID：支持层级结构 (如：大段落包含小段落，或表格包含单元格)。为空表示根节点
+//
+//    image_info TEXT,                            -- 图片信息：若切片包含图片或本身就是图片切片，此处存储 OCR 文本、图片 URL 或 Base64 摘要
+//    relation_chunks JSON,                       -- 直接关联切片：存储显式关联的 Chunk ID 列表 (如：引用关系、超链接指向)。格式：["id1", "id2"]
+//    indirect_relation_chunks JSON,              -- 间接关联切片：存储隐式关联的 Chunk ID 列表 (如：向量相似度极高但未显式引用)。格式：["id3", "id4"]
+//
+//) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+//
+
 // chunkRepository implements the ChunkRepository interface
 type chunkRepository struct {
 	db *gorm.DB

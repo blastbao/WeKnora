@@ -141,6 +141,60 @@ func (e *AgentEngine) GetSkillsManager() *skills.Manager {
 	return e.skillsManager
 }
 
+// Execute 执行智能体（Agent）的核心推理与任务处理流程。
+//
+// 该函数负责协调上下文构建、系统提示词生成、工具注册以及多轮推理循环，直到任务完成或达到最大轮次限制。
+//
+// 执行过程详解：
+// 1. **初始化与日志记录**：
+//    - 记录会话 ID、消息 ID、用户查询内容 Query 及上下文长度。
+//    - 发送 "execute_start" 管道事件，标记执行开始。
+//    - 注册延迟清理函数 (defer)，确保在函数退出时清理所有已注册的工具资源。
+//
+// 2. **状态初始化**：
+//    - 创建并初始化 `AgentState` 对象，用于存储推理过程中的步骤历史 (`RoundSteps`)、
+//      知识引用 (`KnowledgeRefs`)、当前轮次 (`CurrentRound`) 及完成状态 (`IsComplete`)。
+//
+// 3. **系统提示词构建 (System Prompt Construction)**：
+//    - 检查技能管理器 (`skillsManager`) 是否启用。
+//    - **若启用**：获取所有技能元数据，调用 `BuildSystemPromptWithOptions` 构建包含技能信息（渐进式披露 Level 1）的系统提示词。
+//    - **若未启用**：调用标准 `BuildSystemPrompt` 构建基础系统提示词。
+//    - 记录生成的提示词长度及内容（调试级别）。
+//
+// 4. **消息上下文组装**：
+//    - 调用 `buildMessagesWithLLMContext` 将系统提示词、历史对话 (`llmContext`) 和当前用户查询 (`query`) 组装成大模型所需的完整消息列表。
+//    - 记录最终发送给 LLM 的消息总数。
+//
+// 5. **工具定义准备**：
+//    - 调用 `buildToolsForLLM` 获取当前可用的工具定义列表，用于支持大模型的 Function Calling。
+//    - 记录启用的工具数量及名称列表，并发送 "tools_ready" 管道事件。
+//
+// 6. **执行推理循环 (Execution Loop)**：
+//    - 调用 `executeLoop` 进入核心推理循环。在此循环中，Agent 将根据当前状态调用 LLM，
+//      解析工具调用请求，执行具体工具，并将结果反馈给 LLM，直至任务标记为完成。
+//
+// 7. **错误处理**：
+//    - 若 `executeLoop` 返回错误，记录错误日志。
+//    - 通过事件总线 (`eventBus`) 发射 `EventError` 类型事件，包含错误详情及阶段信息 ("agent_execution")。
+//    - 直接返回错误，不返回状态对象。
+//
+// 8. **成功完成与收尾**：
+//    - 若执行成功，记录 "Agent Execution Completed Successfully" 日志。
+//    - 输出统计信息：总轮次、步骤数、完成状态。
+//    - 发送 "execute_complete" 管道事件，包含最终执行统计数据。
+//    - 返回最终的 `AgentState` 对象及 nil 错误。
+//
+// 参数:
+//   - ctx: 上下文控制，用于超时控制和链路追踪。
+//   - sessionID: 当前会话的唯一标识符。
+//   - messageID: 当前用户消息的唯一标识符。
+//   - query: 用户的原始输入查询字符串。
+//   - llmContext: 历史对话消息列表，用于维持多轮对话上下文。
+//
+// 返回:
+//   - *types.AgentState: 包含完整执行轨迹、知识引用和最终状态的指针。
+//   - error: 执行过程中遇到的任何错误，若成功则为 nil。
+
 // Execute executes the agent with conversation history and streaming output
 // All events are emitted to EventBus and handled by subscribers (like Handler layer)
 func (e *AgentEngine) Execute(

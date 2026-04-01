@@ -10,6 +10,21 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// 实现了一个自动化评估系统（Evaluation Framework），专门用于衡量 RAG（检索增强生成）系统的性能。
+// 它通过“钩子（Hook）”机制，在问答流程的各个环节收集数据，最后在流程结束时计算并聚合各项指标。
+//
+// 检索指标 (Retrieval Metrics):
+//	- Precision (精确率): 检索出的相关文档比例。
+//	- Recall (召回率): 所有相关文档中被检出的比例。
+//  - NDCG@3: 归一化折损累计增益，考虑排名位置的相关性（前3位），越相关的排越前得分越高。
+//	- NDCG@10: 归一化折损累计增益，考虑排名位置的相关性（前10位）。
+//	- MRR: 平均倒数排名，关注第一个正确答案出现的位置。
+//	- MAP: 平均精度均值。
+//
+// 生成指标 (Generation Metrics):
+//	- BLEU-1/2/4: 衡量生成文本与标准答案的 n-gram 重叠度（常用于机器翻译/摘要），1/2/4 分别对应不同粒度
+//	- ROUGE-1/2/L: 衡量召回率的变体，常用于文本生成评估。
+
 // MetricList stores and aggregates metric results
 type MetricList struct {
 	results []*types.MetricResult

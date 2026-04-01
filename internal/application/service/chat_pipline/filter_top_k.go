@@ -6,6 +6,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
+// 根据预设的数量限制（Top K），对搜索、合并或重排序后的结果进行截断，只保留最相关的前 K 条数据。
+
 // PluginFilterTopK is a plugin that filters search results to keep only the top K items
 type PluginFilterTopK struct{}
 

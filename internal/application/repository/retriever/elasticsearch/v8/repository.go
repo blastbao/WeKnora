@@ -19,6 +19,130 @@ import (
 	"github.com/google/uuid"
 )
 
+// 向量相似度检索
+//
+// 	场景: 用户输入一段文本，将其转化为向量，在特定知识库中寻找语义最相似的片段。
+//
+// 	POST /xwrag_default/_search
+//	{
+//	 "size": 5,
+//	 "query": {
+//	   "script_score": {
+//		 "query": {
+//		   "bool": {
+//			 "filter": [
+//			   { "term": { "knowledge_base_id.keyword": "kb_001" } },
+//			   { "terms": { "tag_id.keyword": ["tech", "api"] } },
+//			   { "term": { "is_enabled": true } }
+//			 ]
+//		   }
+//		 },
+//		 "script": {
+//		   "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+//		   "params": {
+//			 "query_vector": [0.02, -0.45, 0.88, ..., 0.12]
+//		   }
+//		 },
+//		 "min_score": 1.85
+//	   }
+//	 },
+//	 "_source": ["content", "chunk_id", "source_id", "knowledge_id"]
+//	}
+//
+// 关键词全文检索
+//	场景: 用户搜索包含特定关键词（如 "API error"）的文档片段。
+//
+//	POST /xwrag_default/_search
+//	{
+//	 "size": 5,
+//	 "query": {
+//	   "bool": {
+//		 "must": [
+//		   {
+//			 "match": {
+//			   "content": {
+//				 "query": "API connection timeout error",
+//				 "operator": "or"
+//			   }
+//			 }
+//		   }
+//		 ],
+//		 "filter": [
+//		   { "term": { "knowledge_base_id.keyword": "kb_001" } },
+//		   { "term": { "is_enabled": true } }
+//		 ]
+//	   }
+//	 },
+//	 "_source": ["content", "chunk_id", "score"]
+//	}
+//
+// 混合检索：关键词过滤 + 向量排序
+//
+// 	场景: 既需要语义匹配，又必须包含特定关键词（如产品型号 "X-200"）。
+//
+//	POST /xwrag_default/_search
+//	{
+//	 "size": 5,
+//	 "query": {
+//	   "script_score": {
+//		 "query": {
+//		   "bool": {
+//			 "must": [
+//			   { "match": { "content": "X-200" } }
+//			 ],
+//			 "filter": [
+//			   { "term": { "knowledge_base_id.keyword": "kb_001" } },
+//			   { "term": { "is_enabled": true } }
+//			 ]
+//		   }
+//		 },
+//		 "script": {
+//		   "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+//		   "params": { "query_vector": [0.1, 0.2, ...] }
+//		 }
+//	   }
+//	 }
+//	}
+//
+// 备注：
+// 	当使用 script_score 查询时，Elasticsearch 会自动按 _score 排序，而 _score 就是 script_score 计算出的值。
+//
+//
+// 混合检索（关键词 + 向量加权）
+//
+//	{
+//	 "size": 10,
+//	 "query": {
+//	   "function_score": {
+//		 "query": {
+//		   "bool": {
+//			 "filter": [
+//			   { "term": { "knowledge_base_id.keyword": "kb_001" } },
+//			   { "term": { "is_enabled": true } }
+//			 ]
+//		   }
+//		 },
+//		 "functions": [
+//		   {
+//			 "filter": { "match": { "content": "X-200" } },
+//			 "weight": 2.0  // 包含关键词的文档加权
+//		   },
+//		   {
+//			 "script_score": {
+//			   "script": {
+//				 "source": "cosineSimilarity(params.query_vector, 'embedding')",
+//				 "params": { "query_vector": [0.1, 0.2, ...] }
+//			   }
+//			 },
+//			 "weight": 1.0
+//		   }
+//		 ],
+//		 "score_mode": "sum",
+//		 "boost_mode": "sum"
+//	   }
+//	 }
+//	}
+
 // elasticsearchRepository implements the RetrieveEngineRepository interface for Elasticsearch v8
 type elasticsearchRepository struct {
 	client *elasticsearch.TypedClient // Elasticsearch client instance

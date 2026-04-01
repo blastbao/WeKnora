@@ -60,6 +60,27 @@ func (t *DataAnalysisTool) recordCreatedTable(tableName string) bool {
 	return true
 }
 
+// Cleanup 清理当前会话中由数据分析工具创建的临时数据库表资源。
+//
+// 该函数负责释放会话生命周期内产生的临时表，防止无限增长、资源泄漏。
+//
+// 执行逻辑：
+// 1. **预检查**：检查 `createdTables` 列表是否为空。若为空，记录日志并直接返回，无需执行后续操作。
+// 2. **遍历删除**：
+//    - 遍历 `createdTables` 中记录的所有表名。
+//    - 构造 `DROP TABLE IF EXISTS` SQL 语句，确保即使表不存在也不会报错。
+//    - 使用 `ExecContext` 执行删除操作，携带上下文以支持超时控制。
+//    - **容错处理**：若删除某张表失败，仅记录错误日志，并继续尝试删除列表中的其余表，避免因单点故障导致整体清理中断。
+//    - 若删除成功，记录成功日志。
+// 3. **状态重置**：清理完成后，将 `createdTables` 切片置为 `nil`，释放内存引用并标记资源已回收。
+//
+// 参数:
+//   - ctx: 上下文控制，用于传递取消信号、超时控制及链路追踪信息。
+//
+// 注意:
+//   - 该操作是幂等的，重复调用不会造成副作用。
+//   - 即使部分表删除失败，函数也会尽力完成剩余表的清理工作。
+
 // Cleanup cleans up the session-specific schema
 func (t *DataAnalysisTool) Cleanup(ctx context.Context) {
 	if len(t.createdTables) == 0 {

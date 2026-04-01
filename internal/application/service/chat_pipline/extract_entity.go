@@ -16,6 +16,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// 从用户查询中提取实体（Entity Extraction），并将其构建成图结构数据。
+// 该模块是对话处理流水线（Chat Pipeline）的一部分，旨在通过大模型识别用户意图中的关键实体，
+// 为后续的知识图谱检索或对话处理做准备。
+
 // PluginExtractEntity is a plugin for extracting entities from user queries
 // It uses historical dialog context and large language models to identify key entities in the user's original query
 type PluginExtractEntity struct {
@@ -52,6 +56,41 @@ func NewPluginExtractEntity(
 func (p *PluginExtractEntity) ActivationEvents() []types.EventType {
 	return []types.EventType{types.REWRITE_QUERY}
 }
+
+// PluginExtractEntity 是一个基于图谱的实体抽取插件。
+//
+// 该插件在用户查询重写（REWRITE_QUERY）阶段介入，利用大语言模型（LLM）从用户原始查询中提取关键实体。
+// 它结合了知识库的配置与提示词工程，将非结构化的自然语言转化为结构化的图数据（实体与关系）。
+//
+// 处理流程详解:
+//
+// 1. 环境检查与配置初始化
+//    - 特性开关：检查环境变量 NEO4J_ENABLE 是否开启。若未开启，直接短路退出，不进行实体抽取。
+//    - 模型加载：根据 ChatManage 中的模型 ID 获取可用的对话模型实例。
+//
+// 2. 上下文感知的资源准备
+//    - 知识库关联分析：收集当前会话关联的所有知识库 ID（包括直接指定的 KnowledgeIDs 及其所属的 KnowledgeBaseIDs）。
+//    - 批量元数据获取：调用知识库服务批量获取元数据，筛选出配置了 ExtractConfig 且 Enabled 为 true 的知识库。
+//    - 上下文注入：将筛选出的启用实体抽取的知识库 ID（EntityKBIDs）及关联映射（EntityKnowledge）写回 ChatManage，
+//      为后续的检索插件提供精确的过滤范围，避免全库扫描。
+//
+// 3. 提示词工程与模型推理
+//    - 模板构建：使用预设的 PromptTemplateStructured（包含描述、标签和示例）构建推理上下文。
+//    - 对话生成：构造 System（包含抽取规则与示例）和 User（包含用户原始 Query）消息，调用 LLM 进行推理。
+//    - 参数控制：设置 Temperature 为 0.3 以平衡创造性和确定性，MaxTokens 限制输出长度。
+//
+// 4. 结构化解析与清洗
+//    - 格式化解析：利用正则表达式提取模型输出中的 JSON/YAML 代码块，并将其反序列化为 GraphData 结构。
+//    - 数据清洗：
+//        - 去重合并：合并同名实体的属性。
+//        - 修复图谱：自动补全关系中缺失的孤立节点，确保图谱结构的完整性。
+//        - 过滤无效关系：移除模板中未定义的未知关系类型。
+//
+// 5. 结果回填
+//    - 实体注入：将提取出的实体名称列表（Entity）写回 ChatManage。
+//    - 流程传递：调用 next() 将控制权移交至责任链中的下一个插件。
+//
+// 最终结果：后续的检索插件可以利用这些实体作为关键词或过滤条件，显著提升在大规模知识库中的检索精度。
 
 // OnEvent processes triggered events
 // When receiving a REWRITE_QUERY event, it rewrites the user query using conversation history and the language model
