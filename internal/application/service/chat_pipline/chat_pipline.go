@@ -6,6 +6,18 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
+// 工作流程
+//	注册：
+//		启动时，系统创建 EventManager，并将各种插件（如检索插件、实体提取插件、后处理插件）注册进去。
+//		管理器根据插件声明的兴趣事件，将它们分类放入 listeners，并生成对应的 handlers。
+//	触发：
+//		在聊天主流程中，当走到某个节点（例如：Trigger(EventSearch)）时，管理器查找对应的 handler。
+//	执行：
+//		执行生成的 handler 函数。
+//		该函数会按顺序（或根据插件内部的 next 调用逻辑）依次调用所有相关插件的 OnEvent 方法。
+//	处理：
+//		插件在 OnEvent 中修改 chatManage（例如：填充搜索结果、修改提示词），或者返回错误终止流程。
+
 // Plugin defines the interface for chat pipeline plugins
 // Plugins can handle specific events in the chat pipeline
 type Plugin interface {

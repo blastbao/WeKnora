@@ -1129,7 +1129,7 @@ func (s *sessionService) configureSkillsFromAgent(
 
 }
 
-// buildSearchTargets 构建统一的搜索目标列表（SearchTargets），将知识库 ID 和知识条目 ID 转换为结构化的搜索目标。
+// buildSearchTargets 构建统一的搜索目标列表（SearchTargets），将知识库 ID 和知识 ID 转换为结构化的搜索目标。
 // 它负责解析每个目标的实际租户归属（TenantID），处理自有、组织共享及跨租户共享（通过 Agent）的权限逻辑。
 //
 // 该函数在请求入口处调用一次，将知识库列表和知识条目列表统一转换为 SearchTargets 结构，
@@ -1405,6 +1405,29 @@ func (s *sessionService) KnowledgeQAByEvent(
 	return nil
 }
 
+// SearchKnowledge 执行纯知识库检索（不包含大模型总结生成）
+// 该函数用于在指定的知识库或文件中查找与用户查询最相关的文本片段，
+// 并直接返回经过重排序和合并的原始检索结果，不经过大模型处理。
+//
+// 主要执行步骤:
+//  1. 参数校验与上下文获取: 从上下文中提取租户ID，确保多租户数据隔离。
+//  2. 构建检索目标: 调用 buildSearchTargets 解析知识库ID和文件ID，确定检索目标。
+//  3. 初始化上下文管理器: 创建 ChatManage 对象，填充查询语句、用户信息及系统默认的检索参数（如阈值、TopK、轮数）。
+//  4. 配置重排序模型: 自动查找并加载系统默认的重排序模型，用于优化检索精度。
+//  5. 定义检索流水线: 设定需要触发的事件列表，包括向量检索、重排序、结果合并和过滤。
+//  6. 执行流水线: 依次触发上述事件，通过事件管理器驱动各个插件执行具体的检索逻辑。
+//  7. 结果返回: 若检索成功，返回合并后的结果列表；若无结果或出错，返回相应状态或错误。
+//
+// 参数:
+//   - ctx: 请求上下文，包含租户ID、用户ID及链路追踪信息。
+//   - knowledgeBaseIDs: 待检索的知识库ID列表，支持多库联合检索。
+//   - knowledgeIDs: 待检索的具体知识（文件）ID列表，用于指定特定文件。
+//   - query: 用户的查询语句。
+//
+// 返回值:
+//   - []*types.SearchResult: 检索到的文本片段列表，已按相关性排序。
+//   - error: 检索过程中发生的错误，如参数错误、系统内部错误等。
+
 // SearchKnowledge performs knowledge base search without LLM summarization
 // knowledgeBaseIDs: list of knowledge base IDs to search (supports multi-KB)
 // knowledgeIDs: list of specific knowledge (file) IDs to search
@@ -1521,19 +1544,24 @@ func (s *sessionService) SearchKnowledge(ctx context.Context,
 	return chatManage.MergeResult, nil
 }
 
+// AgentQA 执行基于Agent的问答（支持对话历史和流式输出）
+//
+// 该函数是Agent模式问答的核心入口，支持自定义Agent配置、多轮对话、 知识库检索、MCP工具调用、网络搜索等高级功能。
+// 通过EventBus实现流式事件输出，适用于需要复杂推理和工具调用的场景。
+
 // AgentQA performs agent-based question answering with conversation history and streaming support
 // customAgent is optional - if provided, uses custom agent configuration instead of tenant defaults
 // summaryModelID is optional - if provided, overrides the model from customAgent config
 func (s *sessionService) AgentQA(
-	ctx context.Context,
-	session *types.Session,
-	query string,
-	assistantMessageID string,
-	summaryModelID string,
-	eventBus *event.EventBus,
-	customAgent *types.CustomAgent,
-	knowledgeBaseIDs []string,
-	knowledgeIDs []string,
+	ctx context.Context, // 请求上下文，包含租户ID、用户信息等
+	session *types.Session, // 会话对象，包含ID、租户ID等基础信息
+	query string, // 用户当前查询内容
+	assistantMessageID string, // 助手消息ID，用于标识本次回复
+	summaryModelID string, // 摘要模型ID（可选），覆盖Agent默认配置
+	eventBus *event.EventBus, // 事件总线，用于流式输出事件
+	customAgent *types.CustomAgent, // 自定义Agent配置（必须）
+	knowledgeBaseIDs []string, // 知识库ID列表（可选，通过@提及）
+	knowledgeIDs []string, // 知识文件ID列表（可选，通过@提及）
 ) error {
 	sessionID := session.ID
 	sessionJSON, err := json.Marshal(session)
@@ -1556,10 +1584,16 @@ func (s *sessionService) AgentQA(
 	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query: %s, session: %s",
 		sessionID, agentTenantID, query, string(sessionJSON))
 
+	// 尝试获取租户详细信息，用于后续的配额或配置检查
 	var tenantInfo *types.Tenant
 	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
 		tenantInfo, _ = v.(*types.Tenant)
 	}
+
+	// 如果上下文中的租户信息与 Agent 的不一致，则去数据库加载 Agent 所属租户的信息
+	//
+	// 如果你使用了一个别人分享给你的智能体，系统会自动切换到那个智能体的租户去查找它的模型和知识库，而不是用你家的。
+
 	// When agent belongs to another tenant (shared agent), use agent's tenant for KB/model scope; load tenantInfo if needed
 	if tenantInfo == nil || tenantInfo.ID != agentTenantID {
 		if s.tenantService != nil {
@@ -1573,6 +1607,10 @@ func (s *sessionService) AgentQA(
 		logger.Warnf(ctx, "Tenant info not available for agent tenant %d, proceeding with defaults", agentTenantID)
 		tenantInfo = &types.Tenant{ID: agentTenantID}
 	}
+
+	// 调用 EnsureDefaults() 填充 CustomAgent 缺失配置。
+	// 创建 Agent 运行时配置，将 customAgent 里的配置参数映射到运行时配置 AgentConfig 中。
+	// 同时，根据 CustomAgent 的配置，初始化 AgentConfig 中的技能（Skills）相关参数。
 
 	// Ensure defaults are set
 	customAgent.EnsureDefaults()
@@ -1596,12 +1634,17 @@ func (s *sessionService) AgentQA(
 	// Configure skills based on CustomAgentConfig
 	s.configureSkillsFromAgent(ctx, agentConfig, customAgent)
 
+	// 如果用户在消息里用 @ 提到了具体的库或文件，则覆盖 Agent 原有的默认知识库。
+	// 如果开启了“仅在 @ 文件中检索”且用户本次没 @ ，则直接禁用知识库检索。
+	// 以上都不满足，则使用 Agent 配置里预设的知识库。
+
 	// Resolve knowledge bases: request-level @ mentions take priority over agent config
 	// If RetrieveKBOnlyWhenMentioned is enabled and no @ mentions, don't use KB at all
 	hasExplicitMention := len(knowledgeBaseIDs) > 0 || len(knowledgeIDs) > 0
 	logger.Infof(ctx, "KB resolution: hasExplicitMention=%v, RetrieveKBOnlyWhenMentioned=%v, KBSelectionMode=%s",
 		hasExplicitMention, agentConfig.RetrieveKBOnlyWhenMentioned, customAgent.Config.KBSelectionMode)
 	if hasExplicitMention {
+		// 情况 A：用户强制指定了知识库（例如在输入框里 @ 了某个文档）
 		// User explicitly specified via @ mention
 		if len(knowledgeBaseIDs) > 0 {
 			agentConfig.KnowledgeBases = knowledgeBaseIDs
@@ -1612,14 +1655,19 @@ func (s *sessionService) AgentQA(
 			logger.Infof(ctx, "Using request-specified knowledge IDs: %v", knowledgeIDs)
 		}
 	} else if agentConfig.RetrieveKBOnlyWhenMentioned {
+		// 情况 B：配置了“仅提及才查”，但用户没提 -> 进入“纯模式”，禁用知识库检索，Agent 只靠 LLM 回答，不能查文档
 		// User didn't mention any KB/file, and the setting requires explicit mention
 		agentConfig.KnowledgeBases = nil
 		agentConfig.KnowledgeIDs = nil
 		logger.Infof(ctx, "RetrieveKBOnlyWhenMentioned is enabled and no @ mention found, KB retrieval disabled for this request")
 	} else {
+		// 情况 C：使用 Agent 默认配置的知识库
 		// Use agent's configured knowledge bases based on KBSelectionMode
 		agentConfig.KnowledgeBases = s.resolveKnowledgeBasesFromAgent(ctx, customAgent)
 	}
+
+	// 加载工具。
+	// 如果 Agent 配置了 AllowedTools 则使用它，否则加载系统默认的一套工具（如天气、搜索、计算器等）。
 
 	// Use custom agent's allowed tools if specified, otherwise use defaults
 	if len(customAgent.Config.AllowedTools) > 0 {
@@ -1628,6 +1676,7 @@ func (s *sessionService) AgentQA(
 		agentConfig.AllowedTools = tools.DefaultAllowedTools()
 	}
 
+	// 如果配置了自定义系统提示词，则注入到配置中，这是定义 Agent 角色的关键。
 	// Use custom agent's system prompt if specified
 	if customAgent.Config.SystemPrompt != "" {
 		agentConfig.UseCustomSystemPrompt = true
@@ -1637,6 +1686,7 @@ func (s *sessionService) AgentQA(
 	logger.Infof(ctx, "Custom agent config applied: MaxIterations=%d, Temperature=%.2f, AllowedTools=%v, WebSearchEnabled=%v",
 		agentConfig.MaxIterations, agentConfig.Temperature, agentConfig.AllowedTools, agentConfig.WebSearchEnabled)
 
+	// 设置 Web Search（网络搜索）的最大结果数，若租户有特殊配置则覆盖。
 	// Set web search max results from tenant config if not set (default: 5)
 	if agentConfig.WebSearchMaxResults == 0 {
 		agentConfig.WebSearchMaxResults = 5
@@ -1656,6 +1706,7 @@ func (s *sessionService) AgentQA(
 		logger.Infof(ctx, "No knowledge bases specified for agent, running in pure agent mode")
 	}
 
+	// 根据租户和知识库/知识 ID 列表，构建底层的检索目标对象。
 	// Build search targets using agent's tenant (handler has validated access for shared agent)
 	searchTargets, err := s.buildSearchTargets(ctx, agentTenantID, agentConfig.KnowledgeBases, agentConfig.KnowledgeIDs)
 	if err != nil {
@@ -1664,6 +1715,14 @@ func (s *sessionService) AgentQA(
 	}
 	agentConfig.SearchTargets = searchTargets
 	logger.Infof(ctx, "Agent search targets built: %d targets", len(searchTargets))
+
+	// 确定使用哪个模型，如果请求参数未指定，使用 Agent 默认配置。
+	//
+	// 虽然模型名叫 summary，但在 AgentQA 代码中，它的职责已经远远超出了“总结”：
+	//	- 任务拆解：分析用户的复杂问题。
+	//	- 工具调度：决定什么时候该去搜索，什么时候该用计算器。
+	//	- 推理决策：在 engine.Execute 过程中，它负责每一轮的 Thought（思考）。
+	//	- 内容生成：最后把所有的工具执行结果和知识库内容整合，给出最终答案。
 
 	// Get summary model: prioritize request's summaryModelID, then custom agent config
 	// Note: tenantInfo.ConversationConfig is deprecated, all config comes from customAgent now
@@ -1681,11 +1740,17 @@ func (s *sessionService) AgentQA(
 		logger.Infof(ctx, "Using custom agent's model_id: %s", effectiveModelID)
 	}
 
+	// 获取 summary 模型
 	summaryModel, err := s.modelService.GetChatModel(ctx, effectiveModelID)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to get chat model: %v", err)
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
+
+	// 获取 Rerank 模型
+	//
+	// 重排模型通常工作在 “检索” 和 “生成” 之间。
+	// 如果没有指定知识库（即处于纯 LLM 模式），系统里就没有“一堆文档片段”需要筛选，自然也就不需要重排模型。
 
 	// Get rerank model from custom agent config (only required when knowledge bases are configured)
 	var rerankModel rerank.Reranker
@@ -1706,8 +1771,26 @@ func (s *sessionService) AgentQA(
 		logger.Infof(ctx, "No knowledge bases configured, skipping rerank model initialization")
 	}
 
+	// 获取当前会话的上下文管理器。
+	//
+	// contextManager 是管理对话历史的组件，每个会话有独立的上下文管理器。
+	//	- 对话历史持久化存储
+	//	- 处理历史过长时的压缩、总结
+	//  - 维护当前的系统提示词，用户可以在同一个会话里切换不同的 Agent（角色）
+	//
+	// 如果该会话是第一次使用，会自动创建新的管理器；如果已存在，则返回已有的实例。
+	// 传入 summaryModel 是为了让管理器知道使用哪个模型进行上下文压缩（当历史太长时）。
+
 	// Get or create contextManager for this session
 	contextManager := s.getContextManagerForSession(ctx, session, summaryModel)
+
+	// 获取系统提示词
+	//
+	// 如果开启了联网搜索，生成的 Prompt 会自动包含：“你是一个智能助手。当你不知道答案时，必须调用搜索工具。”。
+	// 否则，可能包含 “你是一个智能助手。请仅根据你已有的知识回答，不要尝试联网。”
+	//
+	// 取到系统提示词之后，把它设置到上下文管理器中。
+	// contextManager 会把旧的提示词换掉，相当于 Agent 切换身份。
 
 	// Set system prompt for the current agent in context manager
 	// This ensures the context uses the correct system prompt when switching agents
@@ -1720,6 +1803,10 @@ func (s *sessionService) AgentQA(
 		}
 	}
 
+	// 利用 contextManager 查找并加载 sessionID 的历史消息列表。
+	// 内部可能会根据模型 Token 限制对过长的历史进行自动截断或总结（取决于实现）。
+	// 这些消息可能是存储在 redis 或数据库中的。
+
 	// Get LLM context from context manager
 	llmContext, err := s.getContextForSession(ctx, contextManager, sessionID)
 	if err != nil {
@@ -1727,6 +1814,11 @@ func (s *sessionService) AgentQA(
 		llmContext = []chat.Message{}
 	}
 	logger.Infof(ctx, "Loaded %d messages from LLM context manager", len(llmContext))
+
+	// 检查配置项 MultiTurnEnabled（多轮对话开关）。
+	//
+	// 有些 Agent 只需要处理当前任务（如：格式化一段文本、翻译一个句子），不需要被之前的对话干扰。
+	// 此时，需要将刚才从数据库/缓存里取出来的 llmContext 彻底清空，使 LLM 不参考任何历史。
 
 	// Apply multi-turn configuration for Agent mode
 	// Note: In Agent mode, context is managed by contextManager with compression strategies,
@@ -1737,21 +1829,25 @@ func (s *sessionService) AgentQA(
 		llmContext = []chat.Message{}
 	}
 
+	// 实例化一个 Agent 执行对象
+
 	// Create agent engine with EventBus and ContextManager
 	logger.Info(ctx, "Creating agent engine")
 	engine, err := s.agentService.CreateAgentEngine(
 		ctx,
-		agentConfig,
-		summaryModel,
-		rerankModel,
-		eventBus,
-		contextManager,
-		session.ID,
+		agentConfig,    // 1. 规则：智能体配置（允许用什么工具、查什么库）
+		summaryModel,   // 2. 大脑：LLM 模型实例
+		rerankModel,    // 3. 过滤器：重排序模型（用于知识库筛选）
+		eventBus,       // 4. 通信线：事件总线（关键！用于流式输出）
+		contextManager, // 5. 记忆管家：负责管理上下文
+		session.ID,     // 6. 身份证：当前会话 ID
 	)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create agent engine: %v", err)
 		return err
 	}
+
+	// 把 llmContext（历史记录）和 query（当前问题）交给引擎开始执行。
 
 	// Execute agent with streaming (asynchronously)
 	// Events will be emitted to EventBus and handled by the Handler layer
