@@ -422,6 +422,158 @@ func NewSequentialThinkingTool() *SequentialThinkingTool {
 	}
 }
 
+// Execute 执行顺序思考工具，记录和管理Agent的思维过程
+//
+// 功能说明:
+//   - 解析并验证顺序思考输入参数
+//   - 维护思维历史记录，支持多步骤推理追踪
+//   - 支持分支思考（Branching），允许从任意步骤分叉探索不同思路
+//   - 动态调整总步数（当实际步数超过预设时自动扩展）
+//   - 判断思考过程是否完成，指导Agent下一步行动
+//
+// 参数:
+//   - ctx: 上下文对象，用于日志记录和超时控制
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - Thought: string 当前思考内容（必填）
+//     - ThoughtNumber: int 当前思考步骤序号（从1开始）
+//     - TotalThoughts: int 预估总思考步数（动态调整）
+//     - NextThoughtNeeded: bool 是否需要下一步思考
+//     - NeedsMoreThoughts: bool 是否需要更多思考（与NextThoughtNeeded类似）
+//     - BranchFromThought: *int 从哪一步分叉（可选，分支思考时使用）
+//     - BranchID: string 分支标识符（可选，如"b1"、"explore-alt"）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 是否成功记录思考（true/false）
+//     - Output: 状态消息（"Thought process recorded"或提示继续思考）
+//     - Data: 结构化数据（map[string]interface{}），包含：
+//         * thought_number: int 当前思考步骤序号
+//         * total_thoughts: int 当前总步数（可能已动态调整）
+//         * next_thought_needed: bool 是否需要下一步
+//         * branches: []string 所有分支ID列表
+//         * thought_history_length: int 历史记录总数
+//         * display_type: string 展示类型（固定为"thinking"）
+//         * thought: string 当前思考内容
+//         * incomplete_steps: bool 是否有未完成的步骤
+//     - Error: 错误信息（验证失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 记录执行开始日志
+//   2. 解析JSON输入参数
+//   3. 验证输入参数（调用validate方法）
+//   4. 动态调整总步数（当前步数>总步数时，扩展总步数）
+//   5. 将当前思考添加到历史记录
+//   6. 处理分支逻辑（如指定了BranchFromThought和BranchID）
+//   7. 记录当前思考内容到Debug日志
+//   8. 准备响应数据（收集分支信息、判断完成状态）
+//   9. 记录执行完成日志
+//   10. 组装返回结果
+//
+// 思考历史管理:
+//   - thoughtHistory: 按时间顺序存储所有思考步骤
+//   - 每个思考包含完整输入信息（内容、序号、分支关系等）
+//   - 支持通过历史回溯查看完整推理过程
+//
+// 分支思考机制:
+//   - BranchFromThought: 指定从哪一步开始分叉（如从第3步分支）
+//   - BranchID: 分支的唯一标识（如"b1"、"strategy-a"）
+//   - branches映射: 按BranchID存储各分支的思考序列
+//   - 支持多分支并行探索不同思路
+//
+// 完成状态判断:
+//   incomplete = NextThoughtNeeded || NeedsMoreThoughts || ThoughtNumber < TotalThoughts
+//   - true: 仍有步骤待完成，Agent应继续思考或调用工具
+//   - false: 思考过程已完成，可以进入下一阶段
+//
+// 动态步数调整:
+//   - 当ThoughtNumber > TotalThoughts时，自动将TotalThoughts设为ThoughtNumber
+//   - 允许Agent在执行过程中扩展思考深度，无需预先精确估计
+//
+// 日志记录:
+//   - Info: 执行开始、执行完成（包含当前步数/总步数）
+//   - Error: 参数解析失败、验证失败
+//   - Debug: 当前思考内容
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误详情
+//   - 验证失败: 返回验证错误（如必填字段缺失、序号非法等）
+//
+// 使用场景:
+//   - Agent需要进行多步推理时，每步调用此工具记录思考
+//   - 复杂问题拆解，逐步分析各个子问题
+//   - 探索多种解决方案，通过分支机制管理不同思路
+//   - 推理过程可视化，展示Agent的"思维链"
+//
+// 与Agent推理流程的集成:
+//   1. Agent面对复杂问题，开始第一步思考
+//   2. 调用SequentialThinking记录当前思路
+//   3. 根据返回的incomplete_steps判断是否需要继续
+//   4. 如需继续，进行下一步思考或调用其他工具获取信息
+//   5. 循环直到思考完成，然后生成最终答案
+//
+// 示例:
+//   // 第一步思考
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Thought": "用户问的是微服务架构优势，我需要从多个维度分析...",
+//       "ThoughtNumber": 1,
+//       "TotalThoughts": 3,
+//       "NextThoughtNeeded": true
+//   }`))
+//
+//   // 第二步思考（分支探索）
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Thought": "从技术维度看：独立部署、技术异构、弹性扩展...",
+//       "ThoughtNumber": 2,
+//       "TotalThoughts": 3,
+//       "NextThoughtNeeded": true,
+//       "BranchFromThought": 1,
+//       "BranchID": "tech-dimension"
+//   }`))
+//
+//   // 最后一步
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Thought": "总结：微服务适合大型复杂系统，但引入运维复杂度...",
+//       "ThoughtNumber": 3,
+//       "TotalThoughts": 3,
+//       "NextThoughtNeeded": false
+//   }`))
+//
+//
+// 返回示例（中间步骤）:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output:  "Thought process recorded - unfinished steps remain, continue exploring and calling tools",
+//		  Data: map[string]interface{}{
+//			  "thought_number":         2,
+//			  "total_thoughts":         3,
+//			  "next_thought_needed":    true,
+//			  "branches":               []string{"tech-dimension"},
+//			  "thought_history_length": 2,
+//			  "display_type":           "thinking",
+//			  "thought":                "从技术维度看：独立部署...",
+//			  "incomplete_steps":       true,
+//		  },
+//		  Error: "",
+//	  }
+//
+// 返回示例（最后一步）:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output:  "Thought process recorded",
+//		  Data: map[string]interface{}{
+//			  "thought_number":         3,
+//			  "total_thoughts":         3,
+//			  "next_thought_needed":    false,
+//			  "branches":               []string{"tech-dimension"},
+//			  "thought_history_length": 3,
+//			  "display_type":           "thinking",
+//			  "thought":                "总结：微服务适合大型复杂系统...",
+//			  "incomplete_steps":       false,
+//		  },
+//		  Error: "",
+//	  }
+
 // Execute executes the sequential thinking tool
 func (t *SequentialThinkingTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][SequentialThinking] Execute started")

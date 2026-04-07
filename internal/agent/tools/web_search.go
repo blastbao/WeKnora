@@ -140,6 +140,187 @@ func NewWebSearchTool(
 //	  - kbID: 存放这些段落的临时仓库地址。
 //	  - newSeen/newIDs: 更新后的“已阅”清单，传回给外层下次使用。
 
+// Execute 执行网络搜索工具，搜索网络信息并支持RAG压缩优化
+//
+// 功能说明:
+//   - 解析并验证输入参数，提取搜索查询词
+//   - 验证租户身份和网络搜索配置
+//   - 调用配置的搜索提供商（Google、Bing、DuckDuckGo等）执行搜索
+//   - 支持RAG（检索增强生成）压缩：抓取网页内容，提取与查询相关的片段，存入临时知识库
+//   - 维护会话级别的临时知识库状态，实现跨搜索调用的内容累积
+//   - 返回格式化的搜索结果，包含标题、URL、摘要和可选的详细内容
+//   - 提供下一步行动建议（使用web_fetch获取完整内容）
+//
+// 参数:
+//   - ctx: 上下文对象，包含租户ID、租户信息等
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - Query: string 搜索查询词（必填）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 搜索是否成功完成（true/false）
+//     - Output: 格式化的搜索结果文本（Markdown格式），包含：
+//         * 搜索查询和结果数量
+//         * 每个结果的标题、URL、摘要、内容预览、发布时间
+//         * 下一步行动建议（提示使用web_fetch获取完整内容）
+//     - Data: 结构化数据（map[string]interface{}），包含：
+//         * query: string 搜索查询词
+//         * results: []map[string]interface{} 搜索结果列表，每项包含：
+//           - result_index: int 结果序号
+//           - title: string 网页标题
+//           - url: string 网页链接
+//           - snippet: string 搜索引擎提供的摘要
+//           - content: string RAG压缩后的详细内容（如启用）
+//           - source: string 搜索来源（google/bing等）
+//           - published_at: string 发布时间（如有）
+//         * count: int 结果数量
+//         * display_type: string 展示类型（固定为"web_search_results"）
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 记录执行开始日志
+//   2. 解析JSON输入参数
+//   3. 验证Query参数非空
+//   4. 从上下文提取租户ID
+//   5. 验证租户ID存在
+//   6. 从上下文获取租户信息，验证网络搜索已配置（WebSearchConfig）
+//   7. 复制搜索配置，设置最大结果数（来自Agent配置）
+//   8. 执行网络搜索（调用webSearchService.Search）
+//   9. 如有结果且启用RAG压缩：
+//      a. 从Redis获取会话的临时知识库状态（tempKBID、已见URL集合、已处理ID列表）
+//      b. 构建问题列表（当前查询词）
+//      c. 执行RAG压缩（CompressWithRAG）：抓取网页、分块、提取相关内容、存入临时KB
+//      d. 保存更新后的临时知识库状态到Redis
+//      e. 使用压缩后的结果替换原始结果
+//  10. 格式化输出结果（构建Markdown文本）
+//  11. 添加下一步行动建议
+//  12. 组装返回结果
+//
+// RAG压缩机制:
+//   目的: 从原始网页中提取与查询真正相关的内容，去除广告、导航等噪声
+//   流程:
+//     1. 抓取搜索结果URL的完整网页内容
+//     2. 将网页内容切分为小块（Chunks）
+//     3. 计算每块与查询问题的相关性
+//     4. 保留高相关性的内容，丢弃低相关性内容
+//     5. 将提取的内容存入会话专属的临时知识库
+//   状态管理:
+//     - 使用Redis存储会话状态（tempKBID、seen、ids）
+//     - 支持跨搜索调用的内容累积（多次搜索在同一临时KB中累积）
+//     - 避免重复处理相同URL
+//   配置: 通过tenant.WebSearchConfig.CompressionMethod控制（"none"禁用）
+//
+// 临时知识库状态（WebSearchTempKBState）:
+//   - tempKBID: 会话专属的临时知识库ID，用于存储提取的内容
+//   - seen: 集合，记录已抓取过的URL，避免重复处理
+//   - ids: 列表，记录已存入临时KB的文档/分片ID
+//   - 存储: Redis，键为sessionID，实现分布式会话状态
+//
+// 搜索配置:
+//   - 提供商: Google、Bing、DuckDuckGo等（tenant.WebSearchConfig.Provider）
+//   - 最大结果数: 来自Agent配置（t.maxResults）
+//   - 压缩方法: 来自租户配置（CompressionMethod）
+//
+// 日志记录:
+//   - Info: 执行开始、搜索参数、结果数量、RAG压缩完成
+//   - Error: 参数缺失、租户ID缺失、搜索未配置、搜索失败
+//   - Warn: RAG压缩失败（降级使用原始结果）
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误，err非nil
+//   - Query为空: 返回"query parameter is required"
+//   - 租户ID缺失: 返回"tenant ID not found in context"
+//   - 搜索未配置: 返回"web search is not configured for this tenant"
+//   - 搜索执行失败: 返回搜索错误详情
+//   - RAG压缩失败: 记录警告，降级使用原始搜索结果
+//
+// 结果格式化:
+//   - 标题、URL必显示
+//   - 摘要（Snippet）如有则显示
+//   - 内容（Content）如有则显示，超过500字符截断并添加"..."
+//   - 发布时间如有则显示
+//
+// 下一步建议:
+//   有结果时:
+//   - 提示内容可能截断，建议使用web_fetch获取完整内容
+//   - 建议提取URL使用web_fetch获取详细信息
+//   - 建议综合多来源信息
+//
+//   无结果时:
+//   - 建议尝试不同查询词
+//   - 建议检查知识库是否有相关信息
+//   - 建议确认主题是否需要实时信息
+//
+// 使用场景:
+//   - Agent需要获取实时网络信息
+//   - 知识库无法回答的问题（时事、最新动态等）
+//   - 需要多来源信息综合判断
+//   - 配合web_fetch形成完整的信息获取流程
+//
+// 典型使用流程:
+//   1. Agent判断需要网络信息
+//   2. 调用WebSearch执行搜索，获取结果列表和摘要
+//   3. 分析搜索结果，选择关键URL
+//   4. 调用WebFetch获取选中URL的完整内容
+//   5. 基于完整内容回答问题
+//
+// 与WebFetchTool的配合:
+//   - WebSearch: 发现信息源，获取摘要
+//   - WebFetch: 深入获取，完整内容
+//   - 典型流程: Search发现 → Fetch深入 → 分析回答
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Query": "2024年人工智能发展趋势"
+//   }`))
+//
+// 成功返回示例（启用RAG）:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output: "=== Web Search Results ===\n" +
+//				  "Query: 2024年人工智能发展趋势\n" +
+//				  "Found 5 result(s)\n\n" +
+//				  "Result #1:\n" +
+//				  "  Title: 2024年AI发展十大趋势 - 科技日报\n" +
+//				  "  URL: https://example.com/ai-trends-2024\n" +
+//				  "  Snippet: 本文分析了2024年人工智能技术的十大发展趋势...\n" +
+//				  "  Content: 1. 大模型技术持续突破 2. 多模态AI成为主流...\n" +
+//				  "  Published: 2024-01-15T08:00:00Z\n\n" +
+//				  "Result #2: ...\n\n" +
+//				  "=== Next Steps ===\n" +
+//				  "- ⚠️ Content may be truncated... Use web_fetch to get full page content.\n",
+//		  Data: map[string]interface{}{
+//			  "query": "2024年人工智能发展趋势",
+//			  "results": []map[string]interface{}{
+//				  {
+//					  "result_index": 1,
+//					  "title":        "2024年AI发展十大趋势 - 科技日报",
+//					  "url":          "https://example.com/ai-trends-2024",
+//					  "snippet":      "本文分析了2024年人工智能技术的十大发展趋势...",
+//					  "content":      "1. 大模型技术持续突破 2. 多模态AI成为主流 3. AI Agent广泛应用...",
+//					  "source":       "google",
+//					  "published_at": "2024-01-15T08:00:00Z",
+//				  },
+//			  },
+//			  "count":        5,
+//			  "display_type": "web_search_results",
+//		  },
+//		  Error: "",
+//	  }
+//
+// 无结果返回示例:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output:  "No web search results found for query: xyzabc123",
+//		  Data: map[string]interface{}{
+//			  "query":   "xyzabc123",
+//			  "results": []interface{}{},
+//			  "count":   0,
+//		  },
+//		  Error: "",
+//	  }
+
 // Execute executes the web search tool
 func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][WebSearch] Execute started")

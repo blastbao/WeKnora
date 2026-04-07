@@ -35,7 +35,8 @@ func (p *PluginChatCompletion) ActivationEvents() []types.EventType {
 // 检索到的知识分片、历史对话及当前意图转化为模型最终的文本输出。
 //
 // 执行过程：
-//  1. 输入审计：记录当前会话的基本信息（SessionID、用户提问、历史轮数、模型 ID）至 Pipeline 日志。
+//  1. 输入审计：
+// 	   记录当前会话的基本信息（SessionID、用户提问、历史轮数、模型 ID）至 Pipeline 日志。
 //  2. 模型准备 (prepareChatModel)：
 //     - 根据配置的 ChatModelID 获取对应的模型实例。
 //     - 初始化推理选项（如 Temperature, TopP, MaxTokens 等）。

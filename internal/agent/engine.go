@@ -41,17 +41,6 @@ import (
 //    - EventAgentToolResult: 传输工具执行后的结构化数据 (Data)，用于前端组件化渲染。
 //    这种机制确保了 UI 层的生动反馈，使用户能够感知 AI 复杂的后台决策链路。
 
-// AgentEngine 是执行 ReAct (Reasoning + Acting) 模式的核心智能体引擎。
-// 它通过依赖注入整合了以下关键组件以构建完整的智能体运行时环境：
-// - config: 控制最大迭代次数、温度及反思策略等行为参数。
-// - chatModel: LLM 推理接口，负责生成思考链与工具调用决策。
-// - toolRegistry: 工具注册中心，负责解析并执行具体的外部动作。
-// - skillsManager: (可选) 实现技能渐进式披露，动态优化 Prompt 中的技能元数据。
-// - knowledgeBasesInfo & selectedDocs: 注入知识库元数据与用户选定文档，构建 RAG 上下文。
-// - contextManager: 负责多轮对话历史的状态管理与持久化存储。
-// - eventBus: 事件总线，实时广播思考过程、工具执行状态及最终结果，实现前后端解耦。
-// - sessionID & systemPromptTemplate: 标识会话上下文并支持自定义系统提示词模板。
-
 // AgentEngine is the core engine for running ReAct agents
 type AgentEngine struct {
 	config               *types.AgentConfig

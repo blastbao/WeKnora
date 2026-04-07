@@ -22,6 +22,22 @@ import (
 
 // Tool name constant for read_skill
 
+// `按需读取技能内容，以学习专业化能力。
+//
+//	## 使用方法
+//	- 当用户请求与可用技能的描述相匹配时，请使用此工具。
+//	- 提供 skill_name 以加载技能的完整指令（SKILL.md 的内容）。
+//	- 可选提供 file_path 以读取技能目录下的其他文件。
+//
+//	## 适用场景
+//	- 当系统提示词中显示的可用技能与用户请求相匹配时。
+//	- 在执行与技能描述相符的任务之前。
+//	- 用于阅读技能目录内的其他文档或参考文件。
+//
+//	## 返回结果
+//	- 完成任务所需的技能指令和指南。
+//	- 如果指定了 file_path，则返回该文件的具体内容。`
+
 var readSkillTool = BaseTool{
 	name: ToolReadSkill,
 	description: `Read skill content on demand to learn specialized capabilities.
@@ -77,6 +93,162 @@ func NewReadSkillTool(skillManager *skills.Manager) *ReadSkillTool {
 // AI 看到列表后，如果发现有用的附件，它才会走 if 分支，去读取“文件内容”。
 // 这样，不需要一次性把所有东西塞给 AI，而是让 AI 先看大纲，觉得有需要再自己去翻细节。
 // 这样，既节省了 Token，又让 AI 的逻辑更清晰。
+
+// Execute 执行读取技能工具，获取技能的详细信息或特定文件内容
+//
+// 功能说明:
+//   - 解析并验证输入参数，提取技能名称和可选的文件路径
+//   - 验证技能系统是否已启用
+//   - 支持两种读取模式：
+//     * 读取技能说明书（SKILL.md）：获取技能的元数据、描述和操作指令
+//     * 读取特定文件：获取技能目录下的脚本、配置或其他文件内容
+//   - 列出技能目录中的可用文件（排除SKILL.md），标注可执行脚本
+//   - 返回格式化的技能信息，供Agent理解和使用
+//
+// 参数:
+//   - ctx: 上下文对象，用于日志记录和超时控制
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - SkillName: string 技能名称（必填）
+//     - FilePath: string 文件路径（可选），指定时读取特定文件，否则读取技能说明书
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 是否成功读取（true/false）
+//     - Output: 格式化的技能信息文本（Markdown格式）
+//     - Data: 结构化数据（map[string]interface{}），两种模式：
+//
+//       模式1 - 读取特定文件（FilePath指定）:
+//         * skill_name: string 技能名称
+//         * file_path: string 文件路径
+//         * content: string 文件内容
+//         * content_length: int 内容长度
+//
+//       模式2 - 读取技能说明书（FilePath为空）:
+//         * skill_name: string 技能名称
+//         * description: string 技能描述
+//         * instructions: string 操作指令（详细的使用说明）
+//         * instructions_length: int 指令长度
+//         * files: []string 技能目录下的文件列表（包含SKILL.md）
+//
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 记录执行开始日志
+//   2. 解析JSON输入参数
+//   3. 验证SkillName必填
+//   4. 检查技能管理器是否可用（skillManager != nil && IsEnabled()）
+//   5. 判断读取模式：
+//      - FilePath指定：调用ReadSkillFile读取特定文件
+//      - FilePath为空：调用LoadSkill读取说明书，ListSkillFiles列出文件
+//   6. 格式化输出内容（Markdown格式）
+//   7. 组装结构化数据
+//   8. 记录执行成功日志
+//   9. 返回结果
+//
+// 读取模式说明:
+//
+// 模式1 - 读取特定文件:
+//   用途：获取技能目录下的脚本、配置、文档等具体内容
+//   调用：指定FilePath参数，如"config.yaml"、"scripts/setup.sh"
+//   输出：文件原始内容，带文件路径标识
+//   适用：Agent需要查看或执行技能的具体文件时
+//
+// 模式2 - 读取技能说明书:
+//   用途：了解技能的功能描述和使用方法
+//   调用：不指定FilePath，仅提供SkillName
+//   输出：技能概况（名称、描述）+ 操作指南（Instructions）+ 附件清单
+//   适用：Agent首次使用某技能，需要了解其能力和调用方式
+//
+// 文件类型识别:
+//   - 脚本文件（.py, .sh等）：在文件列表中标注"(script - can be executed)"
+//   - 其他文件：普通列出
+//   - SKILL.md：不重复列出（已在Instructions中展示）
+//
+// 技能系统依赖:
+//   - skillManager: 技能管理器，负责技能的加载、文件读取、文件列表
+//   - 必须已启用（IsEnabled()返回true）
+//   - 技能以目录形式组织，每个技能一个独立文件夹
+//   - SKILL.md是每个技能的入口文件（说明书）
+//
+// 日志记录:
+//   - Info: 执行开始、执行成功（包含技能名称）
+//   - Error: 参数解析失败、技能加载失败、文件读取失败
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误
+//   - SkillName为空: 返回"skill_name is required"
+//   - 技能系统未启用: 返回"Skills are not enabled"
+//   - 技能加载失败: 返回加载错误详情
+//   - 文件读取失败: 返回读取错误详情
+//   - 列出文件失败: 非致命错误，返回空列表继续
+//
+// 使用场景:
+//   - Agent首次接触某技能，需要阅读说明书了解功能
+//   - Agent需要查看技能的具体脚本内容
+//   - Agent需要获取技能的配置文件
+//   - Agent需要确认技能目录下有哪些可用资源
+//
+// 典型使用流程:
+//   1. Agent发现需要使用某技能（如"data_analysis"）
+//   2. 调用ReadSkill（不指定FilePath）获取说明书
+//   3. 阅读Description和Instructions，了解技能能力
+//   4. 查看Available Files列表，发现需要"scripts/analyze.py"
+//   5. 再次调用ReadSkill（指定FilePath="scripts/analyze.py"）获取脚本内容
+//   6. 根据脚本逻辑执行分析任务
+//
+// 示例:
+//   // 读取技能说明书
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "SkillName": "data_analysis"
+//   }`))
+//
+//   // 读取特定文件
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "SkillName": "data_analysis",
+//       "FilePath": "scripts/analyze.py"
+//   }`))
+//
+// 返回示例（读取说明书）:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output: "=== Skill: data_analysis ===\n\n" +
+//				  "**Description**: 数据分析技能，支持清洗、统计、可视化\n\n" +
+//				  "## Instructions\n\n" +
+//				  "1. 使用 read_data 工具加载数据文件\n" +
+//				  "2. 使用 analyze 工具进行统计分析\n" +
+//				  "3. 使用 visualize 工具生成图表...\n\n" +
+//				  "## Available Files\n\n" +
+//				  "The following files are available...\n\n" +
+//				  "- `scripts/analyze.py` (script - can be executed)\n" +
+//				  "- `templates/chart.html`\n" +
+//				  "- `config.yaml`",
+//		  Data: map[string]interface{}{
+//			  "skill_name":          "data_analysis",
+//			  "description":         "数据分析技能，支持清洗、统计、可视化",
+//			  "instructions":        "1. 使用 read_data 工具加载数据文件\n2. ...",
+//			  "instructions_length": 256,
+//			  "files":               []string{"SKILL.md", "scripts/analyze.py", "templates/chart.html", "config.yaml"},
+//		  },
+//		  Error: "",
+//	  }
+//
+// 返回示例（读取特定文件）:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output: "=== Skill File: data_analysis/scripts/analyze.py ===\n\n" +
+//				  "import pandas as pd\n\n" +
+//				  "def analyze_data(file_path):\n" +
+//				  "    df = pd.read_csv(file_path)\n" +
+//				  "    return df.describe()\n",
+//		  Data: map[string]interface{}{
+//			  "skill_name":     "data_analysis",
+//			  "file_path":      "scripts/analyze.py",
+//			  "content":        "import pandas as pd\n\ndef analyze_data...",
+//			  "content_length": 156,
+//		  },
+//		  Error: "",
+//	  }
 
 // Execute executes the read_skill tool
 func (t *ReadSkillTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {

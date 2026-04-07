@@ -174,6 +174,139 @@ func AvailablePlaceholders() []PlaceholderDefinition {
 // 返回:
 //   - string: 格式化后的 Markdown 字符串。如果列表为空，返回 "None"。
 
+// formatKnowledgeBaseList 格式化知识库信息，生成用于系统提示的Markdown文本
+//
+// 功能说明:
+//   - 将知识库列表格式化为结构化的Markdown文本，供Agent的系统提示使用
+//   - 根据知识库类型（文档/FAQ）采用不同的展示格式
+//   - 包含知识库基本信息（名称、ID、类型、描述、文档数）
+//   - 展示最近添加的文档/FAQ条目（最多10条），以表格形式呈现
+//   - 为Agent提供清晰的知识库上下文，指导其检索策略
+//
+// 参数:
+//   - kbInfos: []*KnowledgeBaseInfo 知识库信息列表，每个元素包含：
+//       * ID: 知识库唯一标识
+//       * Name: 知识库名称
+//       * Type: 知识库类型（document/faq等，空值默认为document）
+//       * Description: 知识库描述
+//       * DocCount: 文档总数
+//       * RecentDocs: []RecentDoc 最近添加的文档列表，包含：
+//         - 文档类型：Title, FileName, Type, CreatedAt, KnowledgeID, FileSize, Description
+//         - FAQ类型：FAQStandardQuestion, FAQAnswers, ChunkID, KnowledgeID, CreatedAt
+//
+// 返回值:
+//   - string: 格式化后的Markdown文本，包含：
+//       * 引导说明（告知Agent应在这些知识库中搜索）
+//       * 知识库基本信息（序号、名称、ID、类型、描述、文档数）
+//       * 最近文档表格（不同类型不同表头）
+//       * 空知识库列表时返回"None"
+//
+// 格式化规则:
+//
+// 引导语:
+//   固定文本："The following knowledge bases have been selected by the user for this conversation.
+//   You should search within these knowledge bases to find relevant information."
+//   作用：明确告知Agent可用的知识库范围
+//
+// 知识库基本信息格式:
+//   {序号}. **{名称}** (knowledge_base_id: `{ID}`)
+//      - Type: {类型}
+//      - Description: {描述}（如有）
+//      - Document count: {文档数}
+//
+// 文档类型知识库表格:
+//   表头: | # | Document Name | Type | Created At | Knowledge ID | File Size | Summary |
+//   行数据:
+//     - Document Name: Title优先，否则FileName
+//     - Type: 文档类型
+//     - Created At: 创建时间
+//     - Knowledge ID: 文档ID（代码格式）
+//     - File Size: 格式化后的文件大小（B/KB/MB/GB）
+//     - Summary: 描述截断至120字符
+//
+// FAQ类型知识库表格:
+//   表头: | # | Question | Answers | Chunk ID | Knowledge ID | Created At |
+//   行数据:
+//     - Question: FAQStandardQuestion优先，否则FileName
+//     - Answers: FAQAnswers用" | "连接，无则"-"
+//     - Chunk ID: 分片ID（代码格式）
+//     - Knowledge ID: 知识ID（代码格式）
+//     - Created At: 创建时间
+//
+// 限制:
+//   - 最近文档最多展示10条（j >= 10时跳出）
+//   - 描述摘要截断至120字符
+//
+// 辅助函数:
+//   - formatFileSize: 将字节数格式化为人类可读的大小（B/KB/MB/GB）
+//   - formatDocSummary: 截断描述文本至指定长度
+//
+// 使用场景:
+//   - Agent系统提示构建：告知Agent可用的知识库资源
+//   - 多知识库会话：展示用户选中的多个知识库
+//   - 知识库预览：让Agent了解知识库内容和规模
+//
+// 调用位置:
+//   - 通常在Agent配置阶段调用，生成系统提示的一部分
+//   - 与ResolveSystemPrompt配合使用，注入知识库上下文
+//
+// 示例:
+//   kbInfos := []*KnowledgeBaseInfo{
+//       {
+//           ID:          "kb-product",
+//           Name:        "产品文档",
+//           Type:        "document",
+//           Description: "产品使用手册和技术文档",
+//           DocCount:    150,
+//           RecentDocs: []RecentDoc{
+//               {Title: "快速入门", FileName: "quickstart.pdf", Type: "pdf", ...},
+//               {Title: "API参考", FileName: "api.md", Type: "markdown", ...},
+//           },
+//       },
+//       {
+//           ID:          "kb-faq",
+//           Name:        "常见问题",
+//           Type:        "faq",
+//           Description: "用户常见问题解答",
+//           DocCount:    500,
+//           RecentDocs: []RecentDoc{
+//               {FAQStandardQuestion: "如何重置密码？", FAQAnswers: []string{"步骤1...", "步骤2..."}, ...},
+//           },
+//       },
+//   }
+//
+//   output := formatKnowledgeBaseList(kbInfos)
+//
+// 返回示例:
+//	  "\nThe following knowledge bases have been selected by the user for this conversation.
+//	  You should search within these knowledge bases to find relevant information.\n\n
+//	  1. **产品文档** (knowledge_base_id: `kb-product`)
+//		 - Type: document
+//		 - Description: 产品使用手册和技术文档
+//		 - Document count: 150
+//		 - Recently added documents:
+//
+//		   | # | Document Name | Type | Created At | Knowledge ID | File Size | Summary |
+//		   |---|---------------|------|------------|--------------|-----------|---------|
+//		   | 1 | 快速入门       | pdf   | 2024-01-15 | `doc-001`    | 2.5 MB   | 本文档介绍产品的快速上手方法... |
+//		   | 2 | API参考        | markdown | 2024-01-10 | `doc-002` | 150 KB  | API详细说明文档... |
+//
+//
+//	  2. **常见问题** (knowledge_base_id: `kb-faq`)
+//		 - Type: faq
+//		 - Description: 用户常见问题解答
+//		 - Document count: 500
+//		 - Recent FAQ entries:
+//
+//		   | # | Question | Answers | Chunk ID | Knowledge ID | Created At |
+//		   |---|----------|---------|----------|--------------|------------|
+//		   | 1 | 如何重置密码？ | 步骤1... \| 步骤2... | `chunk-001` | `faq-001` | 2024-01-20 |
+//
+//	  "
+//
+//	  空列表返回:
+//	  "None"
+
 // formatKnowledgeBaseList formats knowledge base information for the prompt
 func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 	if len(kbInfos) == 0 {

@@ -85,6 +85,112 @@ func NewGraphBuilder(config *config.Config, chatModel chat.Chat) types.GraphBuil
 	}
 }
 
+// extractEntities 从文档块中提取实体
+//
+// 功能说明:
+//   使用大语言模型（LLM）分析文档内容，识别并提取相关实体（如人名、组织、地点、概念等）。
+//   对提取的实体进行去重和合并，维护全局实体映射表，记录实体出现的文档位置。
+//
+// 参数:
+//   - ctx: 上下文对象
+//   - chunk: *types.Chunk 文档块对象，包含：
+//       * ID: 文档块唯一标识
+//       * Content: 文档块文本内容（实体提取的输入）
+//
+// 返回值:
+//   - []*types.Entity: 从当前文档块提取的实体列表（包含新创建和已存在的实体）
+//   - error: 提取过程中的错误，nil表示成功
+//
+// 实体结构（types.Entity）:
+//   - ID: 实体唯一标识（UUID生成）
+//   - Title: 实体标题/名称（如"苹果公司"）
+//   - Description: 实体描述（如"美国科技公司，总部位于库比蒂诺"）
+//   - ChunkIDs: []string 包含该实体的所有文档块ID列表
+//   - Frequency: int 实体出现的频次（跨文档块计数）
+//
+// 执行流程:
+//   1. 记录开始日志，标识处理的文档块ID
+//   2. 检查文档块内容是否为空，空则跳过返回
+//   3. 构建LLM提示词：
+//      - System: 使用配置的ExtractEntitiesPrompt（实体提取指令）
+//      - User: 文档块内容
+//   4. 调用LLM进行实体提取（Temperature=0.1确保确定性）
+//   5. 解析LLM返回的JSON格式实体列表
+//   6. 记录提取的实体详情（日志表格形式）
+//   7. 加锁保护全局映射表（线程安全）
+//   8. 遍历提取的实体，进行去重和合并：
+//      - 新实体: 生成ID，初始化ChunkIDs和Frequency，加入映射表
+//      - 已存在实体: 更新ChunkIDs（如当前块未记录），Frequency++
+//   9. 记录完成日志，返回实体列表
+//
+// 去重策略:
+//   - 基于实体Title（标题）去重，使用entityMapByTitle映射表
+//   - 相同Title的实体视为同一实体，合并描述和出现位置
+//   - 不同文档块中的相同实体，ChunkIDs累积记录
+//
+// 错误处理:
+//   - 文档块为空: 记录警告，返回空列表
+//   - LLM调用失败: 返回错误，包装原始错误
+//   - JSON解析失败: 返回错误，包含LLM原始响应
+//   - 实体字段无效: 跳过该实体，记录警告，继续处理其他
+//
+// LLM配置:
+//   - Temperature: 0.1（低温度，确保提取结果稳定、确定性）
+//   - Thinking: false（不启用思考模式，直接输出结果）
+//
+// 使用场景:
+//   - 知识图谱构建流程中的实体提取阶段
+//   - 文档预处理，识别关键概念和命名实体
+//   - 为后续关系提取提供实体基础
+//
+// 调用位置:
+//   - 由BuildGraph方法调用，并发处理多个文档块
+//   - 每个文档块一个goroutine独立提取
+//
+// 示例:
+//   chunk := &types.Chunk{
+//       ID:      "chunk-001",
+//       Content: "苹果公司由史蒂夫·乔布斯于1976年创立，总部位于加利福尼亚州库比蒂诺。",
+//   }
+//
+//   entities, err := builder.extractEntities(ctx, chunk)
+//
+//   // 返回示例:
+//   // entities = []*types.Entity{
+//   //     {
+//   //         ID:          "uuid-1",
+//   //         Title:       "苹果公司",
+//   //         Description: "美国科技公司，由史蒂夫·乔布斯创立",
+//   //         ChunkIDs:    []string{"chunk-001"},
+//   //         Frequency:   1,
+//   //     },
+//   //     {
+//   //         ID:          "uuid-2",
+//   //         Title:       "史蒂夫·乔布斯",
+//   //         Description: "苹果公司联合创始人",
+//   //         ChunkIDs:    []string{"chunk-001"},
+//   //         Frequency:   1,
+//   //     },
+//   //     {
+//   //         ID:          "uuid-3",
+//   //         Title:       "库比蒂诺",
+//   //         Description: "加利福尼亚州城市，苹果公司总部所在地",
+//   //         ChunkIDs:    []string{"chunk-001"},
+//   //         Frequency:   1,
+//   //     },
+//   // }
+//
+//   // 当日志级别为Info时，输出:
+//   // =========== EXTRACTED ENTITIES ===========
+//   // [Entity 1] Title: '苹果公司', Description: '美国科技公司，由史蒂夫·乔布斯创立'
+//   // [Entity 2] Title: '史蒂夫·乔布斯', Description: '苹果公司联合创始人'
+//   // [Entity 3] Title: '库比蒂诺', Description: '加利福尼亚州城市，苹果公司总部所在地'
+//   // =========================================
+//
+//   // 如果另一个chunk也包含"苹果公司":
+//   // existEntity.ChunkIDs = []string{"chunk-001", "chunk-002"}
+//   // existEntity.Frequency = 2
+
 // extractEntities extracts entities from text chunks
 // It uses LLM to analyze text content and identify relevant entities
 func (b *graphBuilder) extractEntities(ctx context.Context, chunk *types.Chunk) ([]*types.Entity, error) {
@@ -179,6 +285,54 @@ func (b *graphBuilder) extractEntities(ctx context.Context, chunk *types.Chunk) 
 	log.Infof("Completed entity extraction for chunk %s: %d entities", chunk.ID, len(entities))
 	return entities, nil
 }
+
+// extractRelationships 提取实体间关系，构建知识图谱边
+//
+// 执行流程:
+//   1. 记录执行开始日志（实体数量、文本块数量）
+//   2. 检查实体数量是否满足最小要求（MinEntitiesForRelation，默认2个）
+//      - 不满足：记录日志，直接返回nil
+//   3. 将实体切片序列化为JSON字符串
+//   4. 合并所有文本块内容为连续文本
+//      - 若内容为空：记录警告，返回nil
+//   5. 构造LLM对话消息（系统提示词 + 用户输入）
+//      - 系统提示词：来自配置的 ExtractRelationshipsPrompt
+//      - 用户输入：实体JSON + 合并后的文本内容
+//   6. 调用LLM进行关系抽取（Chat接口，Temperature使用默认值）
+//   7. 解析LLM返回的JSON响应，反序列化为 Relationship 切片
+//   8. 记录详细的关系提取日志（序号、源实体、目标实体、描述、强度）
+//   9. 获取互斥锁，并发安全地更新关系映射表
+//  10. 遍历提取的关系列表，逐个处理：
+//      a. 生成唯一键：fmt.Sprintf("%s#%s", Source, Target)
+//      b. 查找关系证据：调用 findRelationChunkIDs 定位同时包含源实体和目标实体的文本块
+//      c. 若无证据块：跳过该关系（记录Debug日志）
+//      d. 检查关系是否已存在：
+//         - 不存在：生成UUID作为ID，设置ChunkIDs，存入relationshipMap，计数器+1
+//         - 已存在：合并新的证据块ID（去重），使用加权平均更新关系强度
+//  11. 记录执行完成日志（新增数量、更新数量）
+//  12. 返回nil
+//
+// 示例:
+//   err := builder.extractRelationships(ctx, chunks, entities)
+//   if err != nil {
+//       log.WithError(err).Error("关系抽取失败")
+//   }
+//
+// 成功执行日志示例:
+//   输入: 3个实体，2个文本块
+//   输出:
+//     INFO  Extracting relationships from 3 entities across 2 chunks
+//     INFO  Extracted 2 relationships
+//     INFO  ========= EXTRACTED RELATIONSHIPS =========
+//     INFO  [Relation 1] Source: 'ent_1', Target: 'ent_2', Description: '创建于', Strength: 8
+//     INFO  [Relation 2] Source: 'ent_2', Target: 'ent_3', Description: '隶属于', Strength: 6
+//     INFO  ===========================================
+//     INFO  Relationship extraction completed: added 2, updated 0 relationships
+//
+// 关系更新示例（已有关系）:
+//   已有关系: A->B, Strength: 7, ChunkIDs: ["chunk_1", "chunk_2"]
+//   新发现: A->B, Strength: 9, ChunkIDs: ["chunk_3"]
+//   更新后: A->B, Strength: (7*2 + 9)/3 = 7, ChunkIDs: ["chunk_1", "chunk_2", "chunk_3"]
 
 // extractRelationships extracts relationships between entities
 // It analyzes semantic connections between multiple entities and establishes relationships

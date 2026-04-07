@@ -220,6 +220,163 @@ func NewListKnowledgeChunksTool(
 	}
 }
 
+// Execute 执行知识文档块列表查询工具，获取指定知识文件的文档片段
+//
+// 功能说明:
+//   - 解析并验证输入参数，提取目标知识文件ID
+//   - 验证知识文件存在性，并检查当前Agent是否有权限访问（通过searchTargets验证）
+//   - 支持跨租户共享知识库场景，使用知识文件的实际租户ID查询
+//   - 分页查询文档块（Chunk）列表，支持文本块和FAQ类型
+//   - 处理文档块中的图片信息（OCR文本、URL、描述等）
+//   - 返回格式化的文档块列表，供Agent详细分析知识内容
+//
+// 参数:
+//   - ctx: 上下文对象，包含租户信息、用户权限等
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - KnowledgeID: string 知识文件ID（必填）
+//     - Limit: int 每页数量（可选，默认20）
+//     - Offset: int 偏移量（可选，默认0）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 查询是否成功完成（true/false）
+//     - Output: 格式化的文档块列表文本（Markdown格式，包含文件信息和片段预览）
+//     - Data: 结构化数据（map[string]interface{}），包含：
+//         * knowledge_id: string 知识文件ID
+//         * knowledge_title: string 知识文件标题
+//         * total_chunks: int 文档块总数
+//         * fetched_chunks: int 本次获取的文档块数量
+//         * page: int 当前页码
+//         * page_size: int 每页大小
+//         * chunks: []map[string]interface{} 文档块详情列表，每个块包含：
+//           - seq: int 序号
+//           - chunk_id: string 块ID
+//           - chunk_index: int 块索引
+//           - content: string 文本内容
+//           - chunk_type: string 块类型（text/faq）
+//           - knowledge_id: string 所属知识文件ID
+//           - knowledge_base: string 所属知识库ID
+//           - start_at: int 起始位置
+//           - end_at: int 结束位置
+//           - parent_chunk_id: string 父块ID（如有）
+//           - images: []map[string]string 图片信息列表（如有），包含：
+//             * url: string 图片URL
+//             * caption: string 图片描述
+//             * ocr_text: string OCR识别文本
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 解析输入参数 → 2. 验证KnowledgeID必填且非空
+//   3. 查询知识文件信息（跨租户支持）→ 4. 验证知识库访问权限（searchTargets检查）
+//   5. 确定有效租户ID（支持共享KB场景）→ 6. 计算分页参数
+//   7. 分页查询文档块（文本+FAQ类型）→ 8. 验证查询结果
+//   9. 查询知识文件标题 → 10. 构建格式化输出
+//   11. 处理文档块图片信息（解析ImageInfo JSON）→ 12. 组装返回结果
+//
+// 权限控制:
+//   - 知识库级别：通过t.searchTargets.ContainsKB()验证，确保只能访问Agent授权的知识库
+//   - 租户隔离：使用知识文件的实际租户ID查询（effectiveTenantID），支持跨租户共享
+//   - 无租户过滤：查询知识文件时跳过租户过滤（GetKnowledgeByIDOnly），支持共享场景
+//
+// 分页逻辑:
+//   - Limit: 默认20，可通过参数指定
+//   - Offset: 从0开始，负数自动修正为0
+//   - Page计算: offset/limit + 1
+//   - 类型过滤: 仅查询ChunkTypeText和ChunkTypeFAQ类型
+//
+// 图片信息处理:
+//   - 解析ImageInfo字段（JSON数组格式）
+//   - 提取URL、Caption、OCRText字段
+//   - 过滤空值，仅保留有效信息
+//   - 组装为结构化列表附加到文档块数据
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误
+//   - KnowledgeID缺失或为空: 返回"knowledge_id is required"
+//   - 知识文件不存在: 返回"Knowledge not found"
+//   - 知识库无访问权限: 返回"Knowledge base %s is not accessible"
+//   - 查询执行失败: 返回数据库错误
+//   - 结果为空: 返回"chunk query returned no data"
+//
+// 跨租户共享支持:
+//   - 查询知识文件时跳过租户过滤（GetKnowledgeByIDOnly）
+//   - 使用知识文件.TenantID作为effectiveTenantID查询文档块
+//   - 权限检查在知识库级别完成（searchTargets.ContainsKB）
+//
+// 日志记录:
+//   - 无显式日志记录（依赖调用方或底层服务日志）
+//
+// 使用场景:
+//   - Agent需要查看某知识文件的完整内容片段
+//   - 用户通过@提及指定文件后，Agent获取详细内容分析
+//   - 需要获取文档中的图片OCR信息辅助理解
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "KnowledgeID": "doc-abc123",
+//       "Limit": 10,
+//       "Offset": 0
+//   }`))
+//
+// 成功返回示例:
+// result = &types.ToolResult{
+//     Success: true,
+//     Output: "## 知识文件: 产品安装手册\n\n**文件ID**: doc-abc123\n" +
+//             "**总片段数**: 150\n**本次获取**: 10\n\n" +
+//             "### 片段 1\n**内容**: 第一章 环境准备...\n\n" +
+//             "### 片段 2\n**内容**: 1.1 系统要求...\n",
+//     Data: map[string]interface{}{
+//         "knowledge_id":    "doc-abc123",
+//         "knowledge_title": "产品安装手册",
+//         "total_chunks":    150,
+//         "fetched_chunks":  10,
+//         "page":            1,
+//         "page_size":       10,
+//         "chunks": []map[string]interface{}{
+//             {
+//                 "seq":          1,
+//                 "chunk_id":     "chunk-001",
+//                 "chunk_index":  0,
+//                 "content":      "第一章 环境准备...",
+//                 "chunk_type":   "text",
+//                 "knowledge_id": "doc-abc123",
+//                 "knowledge_base": "kb-product",
+//                 "start_at":     0,
+//                 "end_at":       500,
+//                 "parent_chunk_id": "",
+//                 "images": []map[string]string{
+//                     {"url": "https://...", "caption": "架构图", "ocr_text": "系统架构..."},
+//                 },
+//             },
+//			   {
+//					"seq":             2,
+//					"chunk_id":        "chunk-002",
+//					"chunk_index":     1,
+//					"content":         "1.1 系统要求\n- 操作系统: Linux...",
+//					"chunk_type":      "text",
+//					"knowledge_id":    "doc-abc123",
+//					"knowledge_base":  "kb-product",
+//					"start_at":        501,
+//					"end_at":          1000,
+//					"parent_chunk_id": "",
+//					"images":          nil,
+//				},
+//
+//             // ...更多片段
+//         },
+//     },
+//     Error: "",
+// }
+//
+// 失败返回示例:
+// result = &types.ToolResult{
+//     Success: false,
+//     Output:  "",
+//     Data:    nil,
+//     Error:   "Knowledge base kb-product is not accessible",
+// }
+
 // Execute performs the chunk fetch against the chunk service.
 func (t *ListKnowledgeChunksTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	// Parse args from json.RawMessage

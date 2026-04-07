@@ -257,6 +257,117 @@ func NewKnowledgeSearchTool(
 	}
 }
 
+// Execute 执行知识库搜索工具，检索与查询相关的文档片段
+//
+// 功能说明:
+//   - 解析并验证工具输入参数，提取查询语句和目标知识库
+//   - 支持用户指定知识库范围，或复用预配置的搜索目标
+//   - 执行多路并发检索（向量搜索+关键词搜索的混合检索）
+//   - 对检索结果进行去重、重排序、多样性优化（MMR）
+//   - 返回格式化的搜索结果，供Agent推理使用
+//
+// 参数:
+//   - ctx: 上下文对象，包含租户信息、配置等
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - Queries: []string 查询语句列表（必填，支持多查询）
+//     - KnowledgeBaseIDs: []string 指定搜索的知识库ID列表（可选）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 搜索是否成功完成（true/false）
+//     - Output: 格式化的搜索结果文本（Markdown格式，包含引用来源）
+//     - Data: 结构化数据，包含：
+//         * results: []SearchResult 搜索结果列表
+//         * queries: []string 实际执行的查询
+//         * knowledge_base_ids: []string 搜索的知识库ID
+//         * total_results: int 总结果数
+//         * search_params: map 搜索参数（topK、阈值等）
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 解析输入参数 → 2. 确定搜索目标（过滤指定KB）→ 3. 验证搜索目标
+//   4. 获取搜索参数（租户配置→全局配置→默认值）→ 5. 执行并发混合检索
+//   6. 初次去重 → 7. 重排序（LLM或专用模型）→ 8. MMR多样性优化
+//   9. 最终去重 → 10. 按分数排序 → 11. 格式化输出
+//
+// 搜索策略:
+//   - 混合检索: 向量相似度 + 关键词匹配，使用RRF融合排序
+//   - 并发执行: 多查询、多知识库并行检索
+//   - 智能重排: 优先使用LLM-based重排，其次使用专用重排模型
+//   - 多样性优化: MMR算法平衡相关性与多样性，避免结果冗余
+//
+// 参数优先级（搜索参数获取）:
+//   租户ConversationConfig > 全局Config > 硬编码默认值
+//   默认: topK=5, vectorThreshold=0.6, keywordThreshold=0.5, minScore=0.3
+//
+// 结果处理流程:
+//   原始结果 → 去重 → 重排序 → MMR筛选 → 最终去重 → 排序 → 格式化
+//
+// 日志记录:
+//   - Info: 执行开始、参数详情、搜索目标、结果统计、Top5结果预览
+//   - Debug: 输入参数JSON、搜索参数、MMR过程、去重过程
+//   - Error: 参数解析失败、搜索目标缺失、查询缺失、格式化失败
+//   - Warn: 重排序失败（降级使用原始结果）、MMR无结果
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误
+//   - 无搜索目标: 返回"no search targets available"
+//   - 无查询语句: 返回"queries parameter is required"
+//   - 重排序失败: 降级使用去重后的原始结果，记录警告
+//   - MMR失败: 降级使用重排序结果，记录警告
+//   - 格式化失败: 返回格式化错误
+//
+// 注意事项:
+//   - 重排序阶段优先使用chatModel（LLM-based），其次使用rerankModel
+//   - RRF分数范围约为[0, 0.033]，与传统[0,1]分数不同，阈值过滤在HybridSearch内部完成
+//   - MMR的k值取min(结果数, topK)，lambda固定为0.7
+//   - 多查询场景下，重排序使用合并后的查询语句
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Queries": ["产品功能介绍", "价格方案"],
+//       "KnowledgeBaseIDs": ["kb-sales", "kb-product"]
+//   }`))
+//
+// 成功返回示例:
+// result = &types.ToolResult{
+//    Success: true,
+//    Output:  `## 搜索结果
+//				**查询**: 产品功能介绍
+//
+//				### 结果 1 (相关度: 0.85)
+//				**来源**: kb-product / 产品手册 v2.1
+//				**内容**: 我们的核心产品支持多租户架构，提供灵活的权限管理...
+//
+//				### 结果 2 (相关度: 0.72)
+//				**来源**: kb-sales / 销售培训资料
+//				**内容**: 产品主要功能包括：1.智能检索 2.知识图谱 3.对话分析...`,
+//	   Data: map[string]interface{}{
+//		   "results": []SearchResult{
+//			   {
+//				   ID:            "chunk-abc123",
+//				   KnowledgeID:   "doc-456",
+//				   KnowledgeName: "产品手册 v2.1",
+//				   Content:       "我们的核心产品支持多租户架构...",
+//				   Score:         0.85,
+//				   QueryType:     "vector",
+//			   },
+//			   // ...更多结果
+//		   },
+//		   "queries":            []string{"产品功能介绍"},
+//		   "knowledge_base_ids": []string{"kb-product", "kb-sales"},
+//		   "total_results":      8,
+//		   "search_params": map[string]interface{}{
+//			   "top_k":             5,
+//			   "vector_threshold":  0.6,
+//			   "keyword_threshold": 0.5,
+//			   "min_score":         0.3,
+//		   },
+//	   },
+//	   Error: "",
+//	}
+
 // Execute executes the knowledge search tool
 func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][KnowledgeSearch] Execute started")

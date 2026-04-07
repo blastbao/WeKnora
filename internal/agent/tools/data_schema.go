@@ -64,6 +64,52 @@ func NewDataSchemaTool(knowledgeService interfaces.KnowledgeService, chunkRepo i
 	}
 }
 
+// Execute 执行数据 Schema 工具，获取指定知识库的表结构信息
+//
+// 功能说明:
+//   - 解析工具输入参数，提取目标知识库 ID
+//   - 通过知识库服务获取知识库基本信息（支持跨租户共享知识库）
+//   - 查询知识库的分块数据，筛选表摘要和列信息类型的分块
+//   - 组装表结构描述信息（表摘要 + 列定义）并返回
+//
+// 参数:
+//   - ctx: 上下文，用于控制执行超时和传递请求上下文
+//   - args: JSON 格式的原始参数，包含以下字段：
+//     - KnowledgeID: 知识库唯一标识符
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 是否成功获取 Schema 信息
+//     - Output: 格式化的表结构描述文本（表摘要 + 列信息）
+//     - Data: 结构化数据，包含 summary（表摘要）和 columns（列信息）
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过 ToolResult.Error 返回
+//
+// 执行流程:
+//   1. 解析输入参数 → 2. 获取知识库信息（跨租户兼容）→ 3. 分页查询分块数据
+//   4. 提取表摘要和列信息分块 → 5. 组装输出结果
+//
+// 分块类型筛选:
+//   - ChunkTypeTableSummary: 表摘要信息（表用途、描述等）
+//   - ChunkTypeTableColumn: 列信息（字段名、类型、约束等）
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误详情
+//   - 知识库不存在: 返回知识库获取失败信息
+//   - 分块查询失败: 返回分块列表获取失败信息
+//   - Schema 信息不完整: 当缺少表摘要或列信息时返回错误
+//
+// 注意事项:
+//   - 使用 IDOnly 模式获取知识库，支持跨租户共享知识库场景
+//   - 分页查询固定为第 1 页、100 条，通常足够覆盖 Schema 相关分块
+//   - 仅提取 TableSummary 和 TableColumn 类型的分块，忽略其他类型
+//   - 输出格式为纯文本拼接，表摘要在前，列信息在后
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "KnowledgeID": "kb_sales_2024"
+//   }`))
+
 // Execute executes the tool logic
 func (t *DataSchemaTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	var input DataSchemaInput

@@ -326,6 +326,78 @@ func (e *EvaluationService) Evaluation(ctx context.Context,
 	return detail, nil
 }
 
+// EvalDataset 执行数据集的评估任务
+//
+// 功能说明:
+//   - 加载指定数据集，获取所有问答对
+//   - 将数据集中的段落创建为临时知识库
+//   - 并行处理每个问答对，执行 RAG 问答流程
+//   - 记录检索、重排序、生成等各阶段的评估指标
+//   - 实时更新任务进度和评估指标
+//   - 评估完成后自动清理临时资源
+//
+// 参数:
+//   - ctx: 上下文，用于控制执行超时和传递日志追踪信息
+//   - detail: 评估任务详情，包含任务配置、参数、指标等信息
+//   - knowledgeBaseID: 临时知识库 ID，用于存储数据集段落
+//
+// 返回值:
+//   - error: 评估过程中的错误，nil 表示评估成功完成
+//
+// 执行流程:
+//   1. 加载数据集 → 2. 创建临时知识库 → 3. 设置资源清理（defer）
+//   4. 初始化并发控制 → 5. 并行处理问答对（RAG 流程）
+//   6. 记录评估指标 → 7. 更新任务进度 → 8. 等待完成 → 9. 清理资源
+//
+// 并发控制:
+//   - 使用 errgroup.Group 管理并发任务
+//   - 工作线程数设置为 CPU 核心数减 1（至少 1 个）
+//   - 使用 sync.Mutex 保护共享的进度计数器和指标数据
+//
+// 评估指标记录:
+//   - recordInit: 初始化当前问答对记录
+//   - recordQaPair: 记录标准问答对信息
+//   - recordSearchResult: 记录检索结果
+//   - recordRerankResult: 记录重排序结果
+//   - recordChatResponse: 记录模型生成回答
+//   - recordFinish: 标记当前问答对评估完成
+//
+// 资源管理:
+//   - 创建临时知识库存储数据集段落
+//   - 使用 defer 确保评估结束后删除临时知识库和知识库
+//   - 删除失败时记录错误日志但不中断流程
+//
+// 进度更新:
+//   - 实时更新已完成数量（finished）和评估指标（Metric）
+//   - 通过 evaluationMemoryStorage 持久化任务状态
+//   - 记录每个问答对的处理日志
+//
+// 错误处理:
+//   - 数据集加载失败: 返回错误，终止评估
+//   - 知识库创建失败: 返回错误，终止评估
+//   - 单个问答对处理失败: 返回错误，终止整个评估任务
+//   - 资源清理失败: 记录错误日志，不影响评估结果
+//
+// 注意事项:
+//   - 评估过程中会修改 detail 对象的状态（通过闭包更新）
+//   - 临时资源清理在函数返回时执行，即使评估失败也会执行
+//   - 评估指标通过 HookMetric 收集，支持多维度分析
+//
+// 调用示例:
+//   detail := &types.EvaluationDetail{
+//       Task: &types.EvaluationTask{ID: "eval_001", DatasetID: "dataset_001"},
+//       Params: &types.ChatManageParams{...},
+//   }
+//   err := service.EvalDataset(ctx, detail, "kb_temp_001")
+//
+// 返回结果:
+//   - 成功: 返回 nil，detail 对象中的 Task.Finished 等于 Task.Total，Metric 包含完整的评估指标（检索准确率、重排序质量、回答相关性等）
+//   - 失败: 返回错误对象，可能的错误包括：
+//       - 数据集不存在或加载失败
+//       - 临时知识库创建失败
+//       - 问答对处理过程中出错
+//       - 并发执行异常
+
 // EvalDataset performs the actual evaluation of a dataset
 // Processes each QA pair in parallel and records metrics
 func (e *EvaluationService) EvalDataset(ctx context.Context, detail *types.EvaluationDetail, knowledgeBaseID string) error {

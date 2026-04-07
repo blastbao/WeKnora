@@ -132,6 +132,92 @@ func NewDatabaseQueryTool(db *gorm.DB) *DatabaseQueryTool {
 	}
 }
 
+// Execute 执行数据库查询工具，在租户隔离的安全环境下执行 SQL 查询
+//
+// 功能说明:
+//   - 解析并验证工具输入参数，提取待执行的 SQL 语句
+//   - 从上下文获取当前租户 ID，实现多租户数据隔离
+//   - 对 SQL 进行安全验证和加固处理（注入防护、租户过滤等）
+//   - 执行加固后的 SQL 查询并获取结果集
+//   - 处理查询结果（类型转换、格式化），返回结构化数据
+//
+// 参数:
+//   - ctx: 上下文，包含租户 ID 等信息，用于控制执行超时和权限验证
+//   - args: JSON 格式的原始参数，包含以下字段：
+//     - SQL: 待执行的 SQL 查询语句（必填）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 查询是否成功执行
+//     - Output: 格式化的查询结果文本（Markdown 表格格式）
+//     - Data: 结构化数据，包含列名、行数据、行数、SQL 语句、租户 ID 等
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过 ToolResult.Error 返回
+//
+// 执行流程:
+//   1. 提取租户 ID → 2. 解析输入参数 → 3. 验证 SQL 参数
+//   4. SQL 安全加固 → 5. 执行查询 → 6. 处理结果集 → 7. 格式化输出
+//
+// 安全机制:
+//   - 租户隔离: 自动注入租户 ID 过滤条件，确保数据访问范围限制在当前租户
+//   - SQL 验证: 通过 validateAndSecureSQL 进行注入攻击防护和语法检查
+//   - 参数化查询: 使用 GORM 的 Raw 方法执行，防止 SQL 注入
+//
+// 数据处理:
+//   - 列值类型转换: 将 []byte 自动转换为 string，提升可读性
+//   - 结果集映射: 将每行数据转换为 map[string]interface{} 格式
+//   - 格式化输出: 生成 Markdown 表格形式的查询结果展示
+//
+// 日志记录:
+//   - Info: 执行开始、原始 SQL、加固后 SQL、执行结果统计
+//   - Debug: 列信息、首行数据样本、格式化过程
+//   - Error: 参数解析失败、SQL 验证失败、查询执行失败、行扫描失败
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误详情
+//   - SQL 参数缺失: 返回参数缺失错误
+//   - SQL 验证失败: 返回验证失败原因
+//   - 查询执行失败: 返回数据库错误信息
+//   - 列获取/行扫描失败: 返回数据处理错误
+//
+// 注意事项:
+//   - 必须确保上下文包含有效的租户 ID，否则租户隔离可能失效
+//   - 所有 SQL 都会经过 validateAndSecureSQL 处理，原始 SQL 不会直接执行
+//   - 查询结果中的二进制数据会自动转换为字符串
+//   - 结果集较大时建议分页处理，避免内存占用过高
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "SQL": "SELECT id, name FROM users WHERE status = 'active'"
+//   }`))
+//
+//
+// 成功返回示例:
+// result = &types.ToolResult{
+//     Success: true,
+//     Output: "| id | name |\n|---|---|\n| 1 | Alice |\n| 2 | Bob |",
+//     Data: map[string]interface{}{
+//         "columns":   []string{"id", "name"},
+//         "rows":      []map[string]interface{}{
+//             {"id": 1, "name": "Alice"},
+//             {"id": 2, "name": "Bob"},
+//         },
+//         "row_count": 2,
+//         "query":     "SELECT id, name FROM users WHERE status = 'active' AND tenant_id = 42",
+//         "tenant_id": 42,
+//         "display_type": "database_query",
+//     },
+//     Error: "",
+// }
+//
+// 失败返回示例:
+// result = &types.ToolResult{
+//     Success: false,
+//     Output:  "",
+//     Data:    nil,
+//     Error:   "SQL validation failed: detected potential SQL injection",
+// }
+
 // Execute executes the database query tool
 func (t *DatabaseQueryTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][DatabaseQuery] Execute started")

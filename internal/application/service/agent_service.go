@@ -75,6 +75,33 @@ func NewAgentService(
 	}
 }
 
+// CreateAgentEngine 创建并初始化一个 Agent 执行引擎（AgentEngine）
+//
+// 该函数负责将 Agent 的运行时配置（AgentConfig）、模型（LLM / Rerank）、工具体系（内置工具 + MCP 工具）、知识库信息、上下文管理器等组件，
+// 组装成一个完整可执行的 Agent 引擎实例。
+//
+// 核心流程包括：
+// 1. 校验 AgentConfig 和基础依赖（如 chatModel）。
+// 2. 创建 ToolRegistry 并注册基础工具（检索、WebSearch 等）。
+// 3. 根据租户配置和 Agent 策略注册 MCP 工具（支持 all / selected / none 模式）。
+// 4. 加载知识库信息（KnowledgeBases）和用户指定文档（KnowledgeIDs），用于 Prompt 增强。
+// 5. 构建系统提示词（System Prompt），支持自定义 Agent Prompt。
+// 6. 初始化 AgentEngine，并注入：模型、工具、EventBus、上下文管理器等。
+// 7. （可选）如果配置了 Skills，则初始化沙箱环境，将技能系统注入以赋予 Agent 执行脚本的能力。
+//
+// 参数说明：
+// - ctx: 上下文对象，用于控制请求生命周期及日志追踪。
+// - config: Agent 运行时配置，包含工具、知识库、推理策略等。
+// - chatModel: 聊天模型（LLM），用于生成回复。
+// - rerankModel: 重排序模型（可为 nil），仅在启用知识库检索时使用。
+// - eventBus: 事件总线，用于 Agent 执行过程中的流式事件分发（如 thought、tool_call、final_answer）。
+// - contextManager: 上下文管理器，用于管理多轮对话历史和系统提示。
+// - sessionID: 当前会话 ID，用于隔离上下文和事件流。
+//
+// 返回值：
+// - interfaces.AgentEngine: 构建完成的 Agent 引擎实例，可用于执行推理。
+// - error: 若配置校验、工具注册或初始化过程中发生错误，则返回对应错误。
+
 // CreateAgentEngineWithEventBus creates an agent engine with the given configuration and EventBus
 func (s *agentService) CreateAgentEngine(
 	ctx context.Context,
@@ -218,6 +245,11 @@ func (s *agentService) CreateAgentEngine(
 	return engine, nil
 }
 
+// WEKNORA_SANDBOX_MODE: 决定技能脚本在哪里运行。
+//	- docker: 最安全，在隔离的容器中运行。如果 Docker 初始化失败，代码包含一个自动降级机制（Fallback），会切换到禁用状态。
+//	- local: 在本地进程运行（风险较高，通常用于开发）。
+//	- disabled: 默认值，不提供执行环境。
+
 // initializeSkillsManager creates and initializes the skills manager
 func (s *agentService) initializeSkillsManager(
 	ctx context.Context,
@@ -292,6 +324,59 @@ func (s *agentService) initializeSkillsManager(
 
 	return skillsManager, nil
 }
+
+// registerTools 注册工具到注册表
+//
+// 功能说明:
+//   - 确定允许注册的工具列表（使用配置指定或默认列表）
+//   - 根据知识库配置过滤相关工具（无知识库时禁用知识类工具）
+//   - 根据 Web 搜索配置启用网络搜索工具
+//   - 实例化每个工具并注册到工具注册表
+//
+// 参数:
+//   - ctx: 上下文，用于日志记录和追踪
+//   - registry: 工具注册表，用于存储和管理工具实例
+//   - config: 代理配置，包含允许的工具列表、知识库配置、Web 搜索开关等
+//   - rerankModel: 重排序模型，用于知识检索结果重排序
+//   - chatModel: 聊天模型，用于 Web 内容获取等场景
+//   - sessionID: 当前会话 ID，用于工具实例的会话隔离
+//
+// 返回值:
+//   - error: 注册过程中的错误，当前实现始终返回 nil
+//
+// 工具过滤逻辑:
+//   - 自定义工具列表: 优先使用 config.AllowedTools 指定的工具
+//   - 默认工具列表: 未指定时使用 tools.DefaultAllowedTools()
+//   - 知识库工具过滤: 无知识库配置时，移除以下工具:
+//     - knowledge_search, grep_chunks, list_knowledge_chunks
+//     - query_knowledge_graph, get_document_info
+//     - database_query, data_analysis, data_schema
+//   - 纯聊天模式: 无知识库且无 Web 搜索时，额外禁用 todo_write
+//   - Web 搜索工具: 启用时添加 web_search 和 web_fetch
+//
+// 工具实例化:
+//   - ToolThinking: 顺序思考工具，支持结构化推理
+//   - ToolTodoWrite: 待办事项管理工具
+//   - ToolKnowledgeSearch: 知识检索工具（需重排序模型和聊天模型）
+//   - ToolGrepChunks: 文本分块搜索工具
+//   - ToolListKnowledgeChunks: 知识分块列表工具
+//   - ToolQueryKnowledgeGraph: 知识图谱查询工具
+//   - ToolGetDocumentInfo: 文档信息获取工具
+//   - ToolDatabaseQuery: 数据库查询工具
+//   - ToolWebSearch: Web 搜索工具（需会话 ID 和最大结果数配置）
+//   - ToolWebFetch: Web 内容获取工具（需聊天模型）
+//   - ToolDataAnalysis: 数据分析工具（需 DuckDB 和会话 ID）
+//   - ToolDataSchema: 数据 Schema 工具
+//
+// 日志记录:
+//   - Info: 使用的工具列表、纯代理模式提示、各工具注册信息、注册总数
+//   - Warn: 工具名称不匹配、未知工具类型
+//
+// 注意事项:
+//   - 工具名称需与注册名一致，不匹配时记录警告但不中断
+//   - 知识库工具依赖多个服务（knowledgeBaseService, knowledgeService, chunkService 等）
+//   - Web 搜索工具需要额外的状态服务（webSearchStateService）
+//   - 数据库查询工具直接使用数据库连接（s.db）
 
 // registerTools registers tools based on the agent configuration
 func (s *agentService) registerTools(

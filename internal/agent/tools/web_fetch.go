@@ -105,6 +105,192 @@ func NewWebFetchTool(chatModel chat.Chat) *WebFetchTool {
 //   - 接收一个列表 items，每项包含 {url, prompt}。
 //   - 使用 sync.WaitGroup 并行抓取所有 URL。
 //   - 在抓取前调用 normalizeGitHubURL 检测是否是 GitHub 文件链接(blob)，自动转换为原始文件链接，确保能直接下载到代码或文本，而不是 HTML 页面。
+
+// Execute 执行网页抓取工具，并发获取多个URL的网页内容
+//
+// 功能说明:
+//   - 解析并验证输入参数，支持批量URL抓取
+//   - 对每个URL进行并发抓取（goroutine并行处理）
+//   - 支持GitHub URL的特殊处理（自动转换为raw内容地址）
+//   - 验证URL合法性和可访问性
+//   - 抓取网页内容并根据提示词（Prompt）进行提取或总结
+//   - 聚合所有结果，生成格式化的抓取报告
+//   - 提供下一步行动建议（基于抓取成功/失败情况）
+//
+// 参数:
+//   - ctx: 上下文对象，用于控制超时和日志记录
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - Items: []WebFetchItem 抓取任务列表（必填），每项包含：
+//       * URL: string 目标网页地址（支持GitHub特殊处理）
+//       * Prompt: string 提取提示词（可选），用于指导内容提取或总结
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 是否全部抓取成功（true=全部成功，false=部分或全部失败）
+//     - Output: 格式化的抓取报告（Markdown格式），包含：
+//         * 每个URL的抓取结果（成功内容或错误信息）
+//         * 下一步行动建议（基于结果给出不同指导）
+//     - Data: 结构化数据（map[string]interface{}），包含：
+//         * results: []map[string]interface{} 成功的抓取结果列表，每项包含：
+//           - url: string 原始URL
+//           - final_url: string 实际抓取的URL（GitHub转换后）
+//           - title: string 页面标题
+//           - content: string 提取的内容
+//           - links: []string 页面链接
+//           - prompt: string 使用的提示词
+//           - fetch_time_ms: int64 抓取耗时
+//         * count: int 成功抓取的URL数量
+//         * display_type: string 展示类型（固定为"web_fetch_results"）
+//     - Error: 错误信息（第一个错误，部分失败时）
+//   - error: 工具框架层面的错误（参数解析失败时）
+//
+// 执行流程:
+//   1. 记录执行开始日志
+//   2. 解析JSON输入参数
+//   3. 验证Items参数非空
+//   4. 初始化结果数组和WaitGroup
+//   5. 为每个URL启动goroutine并发抓取:
+//      a. 规范化GitHub URL（转换为raw.githubusercontent.com）
+//      b. 验证并解析URL（检查协议、可访问性）
+//      c. 执行实际抓取（executeFetch）
+//      d. 存储结果（输出、数据、错误）
+//   6. 等待所有goroutine完成（WaitGroup）
+//   7. 遍历结果，构建格式化输出:
+//      - 写入每个URL的结果（成功内容或错误）
+//      - 收集成功的数据到aggregated
+//      - 标记整体成功状态和第一个错误
+//   8. 添加下一步行动建议（基于成功/失败情况）
+//   9. 组装返回结果
+//
+// 并发处理:
+//   - 每个URL独立goroutine，并行抓取
+//   - 使用sync.WaitGroup等待全部完成
+//   - 无锁设计，每个goroutine写入独立的results[index]
+//   - 总耗时取决于最慢的抓取请求
+//
+// GitHub URL特殊处理:
+//   - 自动检测GitHub blob/tree URL
+//   - 转换为raw.githubusercontent.com直接获取原始内容
+//   - 避免GitHub页面HTML，直接获取代码/文档原文
+//   - 示例: github.com/user/repo/blob/main/file.py → raw.githubusercontent.com/user/repo/main/file.py
+//
+// URL验证:
+//   - 检查URL格式合法性
+//   - 验证协议（http/https）
+//   - 检查域名可访问性
+//   - 规范化最终URL
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误，err非nil
+//   - Items为空: 返回"missing required parameter: items"
+//   - 单个URL验证失败: 记录错误，继续处理其他URL
+//   - 单个URL抓取失败: 记录错误，继续处理其他URL
+//   - 结果nil: 标记为内部错误，继续处理
+//
+// 成功判断:
+//   - 全部成功: Success=true, Error=""
+//   - 部分失败: Success=false, Error=第一个错误
+//   - 全部失败: Success=false, Error=第一个错误
+//
+// 下一步建议:
+//   全部成功时:
+//   - 提示已获取完整内容
+//   - 建议评估内容是否足够回答问题
+//   - 建议综合多页面信息
+//
+//   部分失败时:
+//   - 额外提示部分URL失败
+//   - 建议使用可用内容或尝试替代来源
+//
+//   全部失败时:
+//   - 建议验证URL可访问性
+//   - 建议尝试web_search的其他结果
+//   - 建议检查知识库是否有相关信息
+//
+// 日志记录:
+//   - Info: 执行开始、执行完成（含成功状态和数量）
+//   - Error: 参数缺失、参数解析失败
+//
+// 使用场景:
+//   - Agent需要获取网页详细内容进行分析
+//   - 配合web_search工具，抓取搜索结果的具体页面
+//   - 获取GitHub代码文件内容进行代码审查或分析
+//   - 批量获取多个参考文档进行综合研究
+//
+// 典型使用流程:
+//   1. Agent使用web_search搜索相关信息
+//   2. 从搜索结果中选择关键URL
+//   3. 调用WebFetch批量抓取这些URL的内容
+//   4. 分析抓取的内容，提取关键信息
+//   5. 如内容不足，根据建议继续搜索或尝试其他来源
+//
+// 与WebSearchTool的区别:
+//   - WebSearch: 搜索获取URL列表和摘要
+//   - WebFetch: 深入抓取具体URL的完整内容
+//   - 典型配合: Search发现 → Fetch深入 → 分析综合
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Items": [
+//           {"URL": "https://example.com/article", "Prompt": "提取核心观点和关键数据"},
+//           {"URL": "https://github.com/user/repo/blob/main/README.md", "Prompt": "总结项目功能"}
+//       ]
+//   }`))
+//
+// 全部成功返回示例:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output: "=== Web Fetch Results ===\n\n" +
+//				  "#1:\nURL: https://example.com/article\n标题: 示例文章\n内容: ...\n\n" +
+//				  "#2:\nURL: https://github.com/.../README.md\n标题: Project README\n内容: ...\n\n" +
+//				  "=== Next Steps ===\n" +
+//				  "- ✅ Full page content has been fetched...\n",
+//		  Data: map[string]interface{}{
+//			  "results": []map[string]interface{}{
+//				  {
+//					  "url":           "https://example.com/article",
+//					  "final_url":     "https://example.com/article",
+//					  "title":         "示例文章",
+//					  "content":       "文章核心内容...",
+//					  "links":         []string{"https://example.com/page2"},
+//					  "prompt":        "提取核心观点和关键数据",
+//					  "fetch_time_ms": 1234,
+//				  },
+//				  {
+//					  "url":           "https://github.com/user/repo/blob/main/README.md",
+//					  "final_url":     "https://raw.githubusercontent.com/user/repo/main/README.md",
+//					  "title":         "Project README",
+//					  "content":       "# Project\nThis is a sample project...",
+//					  "links":         []string{},
+//					  "prompt":        "总结项目功能",
+//					  "fetch_time_ms": 890,
+//				  },
+//			  },
+//			  "count":        2,
+//			  "display_type": "web_fetch_results",
+//		  },
+//		  Error: "",
+//	  }
+//
+// 部分失败返回示例:
+//	  result = &types.ToolResult{
+//		  Success: false,
+//		  Output: "=== Web Fetch Results ===\n\n" +
+//				  "#1:\nURL: https://example.com/article\n标题: 示例文章\n内容: ...\n\n" +
+//				  "#2:\nURL: https://broken-site.com\n错误: connection timeout\n\n" +
+//				  "=== Next Steps ===\n" +
+//				  "- ✅ Full page content has been fetched...\n" +
+//				  "- ⚠️ Some URLs failed to fetch. Use available content...\n",
+//		  Data: map[string]interface{}{
+//			  "results": []map[string]interface{}{
+//				  {"url": "https://example.com/article", ...},  // 只有成功的
+//			  },
+//			  "count":        1,
+//			  "display_type": "web_fetch_results",
+//		  },
+//		  Error: "connection timeout",  // 第一个错误
+//	  }
+
 func (t *WebFetchTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][WebFetch] Execute started")
 

@@ -156,6 +156,112 @@ func NewGetDocumentInfoTool(
 	}
 }
 
+// Execute 并发获取多个文档的详细信息
+//
+// 功能说明:
+//   - 解析输入参数，提取知识库文档 ID 列表（最多 10 个）
+//   - 并发查询每个文档的元数据和分块统计信息
+//   - 支持跨租户共享知识库场景（使用 GetKnowledgeByIDOnly）
+//   - 验证文档所在知识库的访问权限（检查 searchTargets）
+//   - 汇总成功和失败的结果，生成格式化报告
+//
+// 参数:
+//   - ctx: 上下文，用于控制并发执行超时
+//   - args: JSON 格式的原始参数，包含以下字段：
+//     - KnowledgeIDs: 知识库文档 ID 数组，必填，长度 1-10
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 是否至少成功获取一个文档信息
+//     - Output: 格式化的文档信息文本（中文格式，包含成功/失败统计）
+//     - Data: 结构化数据，包含文档列表、统计数量、错误信息等
+//     - Error: 全部失败时的错误汇总
+//   - error: 工具框架层面的错误
+//
+// 执行流程:
+//   1. 解析参数 → 2. 校验 ID 列表（非空、≤10个）→ 3. 并发获取文档信息
+//   4. 权限验证 → 5. 查询分块数量 → 6. 汇总结果 → 7. 格式化输出
+//
+// 并发处理:
+//   - 使用 sync.WaitGroup 协调多个 goroutine 并发执行
+//   - 使用 sync.Mutex 保护共享的 results map 写入操作
+//   - 每个文档独立查询，互不阻塞，提升整体性能
+//
+// 权限控制:
+//   - 通过 searchTargets.ContainsKB 验证知识库访问权限
+//   - 使用文档实际的 TenantID 查询分块（支持跨租户共享）
+//   - 无权限访问的文档记录错误但不影响其他文档
+//
+// 输出格式:
+//   - 显示成功/失败统计
+//   - 列出失败项及原因
+//   - 逐个展示文档详情：ID、标题、描述、来源、文件信息、处理状态、分块数、元数据
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误
+//   - 知识库 ID 为空: 返回必填校验错误
+//   - ID 数量超过 10 个: 返回数量限制错误
+//   - 单个文档获取失败: 记录错误，继续处理其他文档
+//   - 全部失败: 返回汇总错误信息
+//
+// 注意事项:
+//   - 支持跨租户共享知识库，使用 GetKnowledgeByIDOnly 绕过租户过滤
+//   - 分块查询固定 PageSize 为 1000，仅统计 text 类型分块
+//   - 输出文本为中文格式，适合直接展示给用户
+//   - 第一个文档的标题会单独提取用于前端摘要显示
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "KnowledgeIDs": ["doc_001", "doc_002", "doc_003"]
+//   }`))
+//
+// 返回示例:
+//   {
+//       "Success": true,
+//       "Output": "=== 文档信息 ===\n\n成功获取 2 / 3 个文档信息\n\n=== 部分失败 ===\n  - doc_003: 无法获取文档信息: record not found\n\n【文档 #1】\n  ID:       doc_001\n  标题:     2024年销售报告\n  描述:     包含全年销售数据分析\n  来源:     file_upload\n  文件名:   sales_2024.pdf\n  文件类型: application/pdf\n  文件大小: 2.5 MB\n  处理状态: 解析完成\n  分块数量: 45 个\n  元数据:\n    - department: sales\n    - year: 2024\n\n【文档 #2】\n  ID:       doc_002\n  标题:     产品规格说明书\n  来源:     web_crawl\n  处理状态: 解析完成\n  分块数量: 12 个\n",
+//       "Data": {
+//           "documents": [
+//               {
+//                   "knowledge_id": "doc_001",
+//                   "title": "2024年销售报告",
+//                   "description": "包含全年销售数据分析",
+//                   "type": "file",
+//                   "source": "uploads/sales_2024.pdf",
+//                   "file_name": "sales_2024.pdf",
+//                   "file_type": "application/pdf",
+//                   "file_size": 2621440,
+//                   "parse_status": "completed",
+//                   "chunk_count": 45,
+//                   "metadata": {
+//                       "department": "sales",
+//                       "year": 2024
+//                   }
+//               },
+//               {
+//                   "knowledge_id": "doc_002",
+//                   "title": "产品规格说明书",
+//                   "description": "",
+//                   "type": "web",
+//                   "source": "https://example.com/specs",
+//                   "file_name": "",
+//                   "file_type": "",
+//                   "file_size": 0,
+//                   "parse_status": "completed",
+//                   "chunk_count": 12,
+//                   "metadata": null
+//               }
+//           ],
+//           "total_docs": 2,
+//           "requested": 3,
+//           "errors": [
+//               "doc_003: 无法获取文档信息: record not found"
+//           ],
+//           "display_type": "document_info",
+//           "title": "2024年销售报告"
+//       },
+//       "Error": ""
+//   }
+
 // Execute retrieves document information with concurrent processing
 func (t *GetDocumentInfoTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	// Parse args from json.RawMessage

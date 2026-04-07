@@ -167,6 +167,121 @@ func NewGrepChunksTool(db *gorm.DB, searchTargets types.SearchTargets) *GrepChun
 	}
 }
 
+// Execute 执行文本分块搜索工具（Grep），在知识库中搜索匹配指定模式的文本块
+//
+// 功能说明:
+//   - 解析输入参数，支持多模式正则匹配搜索
+//   - 验证搜索范围（知识库 ID 列表、文档 ID 列表）的访问权限
+//   - 执行分块搜索，获取匹配指定模式的文本块
+//   - 对搜索结果进行去重、评分、MMR（最大边际相关性）重排序
+//   - 按知识库聚合结果，生成格式化搜索报告
+//
+// 参数:
+//   - ctx: 上下文，用于控制执行超时和传递日志追踪信息
+//   - args: JSON 格式的原始参数，包含以下字段：
+//     - Pattern: 搜索模式数组，必填，支持多个正则表达式
+//     - MaxResults: 最大返回结果数（默认: 50，范围: 1-200）
+//     - KnowledgeBaseIDs: 指定搜索的知识库 ID 列表（可选，默认使用所有可访问知识库）
+//     - CountOnly: 仅返回计数（当前固定为 false）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 搜索是否成功执行
+//     - Output: 格式化的搜索结果文本（包含匹配统计、文档详情、匹配片段）
+//     - Data: 结构化数据，包含模式、结果列表、统计数量、知识库 ID 等
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误
+//
+// 执行流程:
+//   1. 解析参数 → 2. 验证搜索模式 → 3. 确定搜索范围（权限校验）
+//   4. 执行分块搜索 → 5. 去重处理 → 6. 匹配评分 → 7. MMR 重排序
+//   8. 按知识库聚合 → 9. 格式化输出
+//
+// 搜索范围控制:
+//   - 从 searchTargets 获取允许访问的知识库 ID 和租户映射
+//   - 提取指定的文档 ID 列表（SearchTargetTypeKnowledge 类型）
+//   - 输入的知识库 ID 必须与允许列表做交集验证
+//   - 未指定知识库时，默认搜索所有可访问知识库
+//
+// 结果处理算法:
+//   - 去重: deduplicateChunks 移除重复或近似重复的分块
+//   - 评分: scoreChunks 基于匹配次数和位置计算相关性分数
+//   - MMR: 当结果超过 10 条时，应用最大边际相关性算法（lambda=0.7）平衡相关性和多样性
+//   - 排序: 先按匹配模式数降序，再按分数降序，最后按分块索引升序
+//   - 聚合: aggregateByKnowledge 按知识库分组，限制最多 20 个知识库
+//
+// 日志记录:
+//   - Info: 执行开始、参数详情、搜索结果数、去重后数量、MMR 结果数、聚合统计
+//   - Debug: MMR 处理详情
+//   - Error: 参数解析失败、模式缺失、搜索失败
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误详情
+//   - 搜索模式为空: 返回模式必填错误
+//   - 搜索执行失败: 返回搜索失败原因
+//
+// 注意事项:
+//   - 搜索模式为正则表达式，需确保语法正确
+//   - 结果数量受 MaxResults 限制，但 MMR 处理时会临时扩展
+//   - 最终输出限制最多 20 个知识库的聚合结果
+//   - 支持跨租户知识库搜索，通过 KBTenantMap 确定租户上下文
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "Pattern": ["error", "exception", "failed"],
+//       "MaxResults": 30,
+//       "KnowledgeBaseIDs": ["kb_logs", "kb_errors"]
+//   }`))
+//
+// 返回示例:
+//   {
+//       "Success": true,
+//       "Output": "=== Grep 搜索结果 ===\n\n搜索模式: [error, exception, failed]\n匹配知识库: 2 个\n总匹配数: 15\n\n【知识库: kb_logs】\n文档: system_logs (ID: doc_001)\n  [分块 #3] 匹配模式: 2 个 | 分数: 8.5\n  内容片段: ...connection error: timeout exception...\n  \n  [分块 #7] 匹配模式: 1 个 | 分数: 5.2\n  内容片段: ...process failed with exit code 1...\n\n【知识库: kb_errors】\n文档: error_codes (ID: doc_002)\n  [分块 #12] 匹配模式: 3 个 | 分数: 10.0\n  内容片段: ...error: exception failed to handle...\n",
+//       "Data": {
+//           "patterns": ["error", "exception", "failed"],
+//           "knowledge_results": [
+//               {
+//                   "knowledge_id": "doc_001",
+//                   "knowledge_base_id": "kb_logs",
+//                   "title": "system_logs",
+//                   "chunks": [
+//                       {
+//                           "chunk_index": 3,
+//                           "content": "...connection error: timeout exception...",
+//                           "matched_patterns": ["error", "exception"],
+//                           "match_score": 8.5
+//                       },
+//                       {
+//                           "chunk_index": 7,
+//                           "content": "...process failed with exit code 1...",
+//                           "matched_patterns": ["failed"],
+//                           "match_score": 5.2
+//                       }
+//                   ]
+//               },
+//               {
+//                   "knowledge_id": "doc_002",
+//                   "knowledge_base_id": "kb_errors",
+//                   "title": "error_codes",
+//                   "chunks": [
+//                       {
+//                           "chunk_index": 12,
+//                           "content": "...error: exception failed to handle...",
+//                           "matched_patterns": ["error", "exception", "failed"],
+//                           "match_score": 10.0
+//                       }
+//                   ]
+//               }
+//           ],
+//           "result_count": 2,
+//           "total_matches": 15,
+//           "knowledge_base_ids": ["kb_logs", "kb_errors"],
+//           "max_results": 30,
+//           "display_type": "grep_results"
+//       },
+//       "Error": ""
+//   }
+
 // Execute executes the grep chunks tool
 func (t *GrepChunksTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][GrepChunks] Execute started")

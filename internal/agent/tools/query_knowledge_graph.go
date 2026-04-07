@@ -242,6 +242,182 @@ func NewQueryKnowledgeGraphTool(knowledgeService interfaces.KnowledgeBaseService
 //	✓ 结果已跨知识库去重并按相关度排序
 //	✓ 使用 get_chunk_detail 获取完整内容
 
+// Execute 执行知识图谱查询工具，在多个知识库中并发检索图谱相关信息
+//
+// 功能说明:
+//   - 解析并验证输入参数，支持最多10个知识库的并发查询
+//   - 验证每个知识库的图谱抽取配置（ExtractConfig）
+//   - 并发执行混合检索（HybridSearch），聚合多知识库结果
+//   - 跨知识库结果去重，按相关度排序
+//   - 生成详细的图谱配置状态报告和查询结果展示
+//   - 构建结构化图谱数据，支持前端可视化
+//
+// 参数:
+//   - ctx: 上下文对象，用于控制超时和传递租户信息
+//   - args: JSON格式的原始参数，包含以下字段：
+//     - KnowledgeBaseIDs: []string 知识库ID列表（必填，1-10个）
+//     - Query: string 查询语句（必填）
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 查询是否成功完成（true/false，无结果也返回true）
+//     - Output: 格式化的查询报告（Markdown格式，包含配置状态、结果统计、详细内容）
+//     - Data: 结构化数据（map[string]interface{}），包含：
+//         * knowledge_base_ids: []string 查询的知识库ID列表
+//         * query: string 查询语句
+//         * results: []map[string]interface{} 格式化结果列表，每项包含：
+//           - result_index: int 结果序号
+//           - chunk_id: string 文档块ID
+//           - content: string 内容片段
+//           - score: float64 相关度分数
+//           - relevance_level: string 相关度等级（高/中/低）
+//           - knowledge_id: string 知识文件ID
+//           - knowledge_title: string 知识文件标题
+//           - match_type: string 匹配方式（向量/关键词/混合）
+//         * count: int 去重后的总结果数
+//         * kb_counts: map[string]int 各知识库结果数量统计
+//         * graph_configs: map[string]interface{} 各知识库图谱配置
+//         * graph_data: map[string]interface{} 可视化图谱数据
+//         * has_graph_config: bool 是否有知识库配置了图谱
+//         * errors: []string 错误信息列表（部分失败时）
+//         * display_type: string 展示类型（固定为"graph_query_results"）
+//     - Error: 错误信息（执行失败时，部分失败通过Data.errors返回）
+//   - error: 工具框架层面的错误，业务逻辑错误通过ToolResult.Error返回
+//
+// 执行流程:
+//   1. 解析输入参数 → 2. 验证KnowledgeBaseIDs非空且不超过10个
+//   3. 验证Query非空 → 4. 初始化并发查询结构
+//   5. 为每个知识库启动goroutine并发查询:
+//      a. 获取知识库信息
+//      b. 检查图谱抽取配置（ExtractConfig）
+//      c. 执行混合检索（HybridSearch）
+//      d. 存储结果或错误
+//   6. 等待所有查询完成（WaitGroup）
+//   7. 聚合结果: 收集错误、统计配置、去重、排序
+//   8. 生成格式化输出报告（配置状态、结果统计、详细内容）
+//   9. 构建可视化图谱数据
+//   10. 组装返回结果
+//
+// 并发处理:
+//   - 使用sync.WaitGroup协调多个知识库的并发查询
+//   - 使用sync.Mutex保护共享的kbResults映射
+//   - 每个知识库独立goroutine，互不阻塞
+//   - 等待所有查询完成后统一处理结果
+//
+// 图谱配置验证:
+//   - 检查kb.ExtractConfig是否存在
+//   - 检查Nodes或Relations是否至少有一个非空
+//   - 未配置的知识库记录错误，不影响其他知识库查询
+//
+// 结果处理:
+//   - 去重: 基于Chunk ID（seenChunks映射）去重
+//   - 排序: 按Score降序排列
+//   - 分组: 输出时按KnowledgeID分组展示
+//   - 相关度分级: 调用GetRelevanceLevel将分数转换为高/中/低
+//
+// 输出内容结构:
+//   === 知识图谱查询 ===
+//   📊 查询: {query}
+//   🎯 目标知识库: {ids}
+//   ✓ 找到 {n} 条相关结果（已去重）
+//
+//   === ⚠️ 部分失败 === (如有)
+//   - KB xxx: 错误信息
+//
+//   === 📈 图谱配置状态 ===
+//   知识库【xxx】:
+//     ✓ 实体类型 (n): [类型列表]
+//     ✓ 关系类型 (m): [关系列表]
+//   或: ⚠️ 未配置图谱抽取
+//
+//   === 📚 知识库覆盖 ===
+//   - xxx: n 条结果
+//
+//   === 🔍 查询结果 ===
+//   【来源文档: xxx】
+//   结果 #1:
+//     📍 相关度: 0.85 (高)
+//     🔗 匹配方式: 混合匹配
+//     📄 内容: xxx
+//     🆔 chunk_id: xxx
+//
+//   === 💡 使用提示 ===
+//
+// 错误处理:
+//   - 参数解析失败: 返回解析错误
+//   - KnowledgeBaseIDs为空: 返回"knowledge_base_ids is required"
+//   - KnowledgeBaseIDs超过10个: 返回"at most 10 KB IDs"
+//   - Query为空: 返回"query is required"
+//   - 单个知识库获取失败: 记录错误，继续处理其他
+//   - 单个知识库未配置图谱: 记录错误，继续处理其他
+//   - 单个知识库查询失败: 记录错误，继续处理其他
+//   - 全部失败: 返回空结果列表，Success=true（业务上视为查询完成）
+//
+// 降级策略:
+//   - 部分知识库失败时，返回其他知识库的结果
+//   - 未配置图谱的知识库，仍返回混合检索结果（基于文本相似度）
+//   - 无图谱配置时，提示用户配置以获得更好效果
+//
+// 可视化数据:
+//   - 调用buildGraphVisualizationData构建图谱数据
+//   - 包含节点、关系、文档关联等信息
+//   - 供前端渲染知识图谱网络图
+//
+// 使用场景:
+//   - Agent需要基于知识图谱进行推理和问答
+//   - 用户询问涉及实体关系的问题（如"A和B的关系"）
+//   - 需要跨多个知识库综合检索相关信息
+//   - 需要查看知识库的图谱配置状态
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "KnowledgeBaseIDs": ["kb-product", "kb-tech"],
+//       "Query": "微服务架构的优势"
+//   }`))
+//
+// 成功返回示例:
+//	  result = &types.ToolResult{
+//		  Success: true,
+//		  Output: "=== 知识图谱查询 ===\n\n📊 查询: 微服务架构的优势\n...",
+//		  Data: map[string]interface{}{
+//			  "knowledge_base_ids": []string{"kb-product", "kb-tech"},
+//			  "query":              "微服务架构的优势",
+//			  "results": []map[string]interface{}{
+//				  {
+//					  "result_index":    1,
+//					  "chunk_id":        "chunk-001",
+//					  "content":         "微服务架构具有以下优势...",
+//					  "score":           0.92,
+//					  "relevance_level": "高",
+//					  "knowledge_id":    "doc-abc",
+//					  "knowledge_title": "微服务设计指南",
+//					  "match_type":      "混合匹配",
+//				  },
+//			  },
+//			  "count":            15,
+//			  "kb_counts":        map[string]int{"kb-product": 10, "kb-tech": 8},
+//			  "graph_configs":    map[string]interface{}{...},
+//			  "graph_data":       map[string]interface{}{"nodes": [...], "edges": [...]},
+//			  "has_graph_config": true,
+//			  "errors":           []string{"kb-tech: 未配置知识图谱抽取"},
+//			  "display_type":     "graph_query_results",
+//		  },
+//		  Error: "",
+//	  }
+//
+// 全部失败返回示例:
+//	  result = &types.ToolResult{
+//		  Success: true,  // 查询完成，但无有效结果
+//		  Output:  "未找到相关的图谱信息。",
+//		  Data: map[string]interface{}{
+//			  "knowledge_base_ids": []string{"kb-empty"},
+//			  "query":              "xxx",
+//			  "results":            []interface{}{},
+//			  "errors":             []string{"kb-empty: 获取知识库失败: not found"},
+//		  },
+//		  Error: "",
+//	  }
+
 // Execute performs the knowledge graph query with concurrent KB processing
 func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	// Parse args from json.RawMessage

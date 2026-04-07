@@ -126,6 +126,60 @@ func (t *DataAnalysisTool) Cleanup(ctx context.Context) {
 //	 - Output (字符串)：这是给 AI 看的文本摘要，包含执行了什么 SQL，回了多少行，具体数据是什么。
 //	 - Data (Map)：这是结构化数据，通常用于前端 UI 展示（比如在对话框里直接画出一个表格或图表）。
 
+// Execute 在 DuckDB 上执行 SQL 查询（仅允许只读查询）
+//
+// 功能说明:
+//   - 解析并验证数据分析工具的输入参数
+//   - 根据 Knowledge ID 加载对应的数据表 Schema 信息
+//   - 将 SQL 中的 Knowledge ID 替换为实际的表名
+//   - 执行严格的只读查询安全检查（拒绝任何数据修改操作）
+//   - 进行全面的 SQL 安全验证（多语句阻断、危险函数过滤、表名白名单等）
+//   - 执行查询并格式化返回结果
+//
+// 参数:
+//   - ctx: 上下文，用于控制执行超时和传递请求上下文
+//   - args: JSON 格式的原始参数，包含以下字段：
+//     - KnowledgeID: 知识库 ID，用于定位数据表
+//     - Sql: 待执行的 SQL 查询语句
+//
+// 返回值:
+//   - *types.ToolResult: 工具执行结果，包含以下内容：
+//     - Success: 查询是否成功执行
+//     - Output: 格式化的查询结果文本（Markdown 表格格式）
+//     - Data: 结构化数据，包含查询结果行、行数、SQL 语句、会话 ID 等
+//     - Error: 错误信息（执行失败时）
+//   - error: 工具框架层面的错误，业务逻辑错误通过 ToolResult.Error 返回
+//
+// 执行流程:
+//   1. 解析输入参数 → 2. 加载知识库 Schema → 3. 替换表名引用
+//   4. 只读查询检查 → 5. SQL 安全验证 → 6. 执行查询 → 7. 格式化输出
+//
+// 安全机制:
+//   - 只读限制: 仅允许 SELECT/SHOW/DESCRIBE/EXPLAIN/PRAGMA 语句
+//   - 多语句阻断: 禁止执行多个 SQL 语句（防止语句注入）
+//   - 危险函数过滤: 阻断可能导致安全风险的函数调用
+//   - 表名白名单: 仅允许访问指定的数据表
+//   - RangeFunction 攻击防护: 通过 validateSelectStmt 启用
+//
+// 错误处理:
+//   - 参数解析失败: 记录错误日志，返回解析错误详情
+//   - 知识库加载失败: 记录错误日志，返回 Knowledge ID 加载失败信息
+//   - 非只读查询: 记录警告日志，返回修改操作不允许的提示
+//   - SQL 验证失败: 记录警告日志，返回验证错误列表
+//   - 查询执行失败: 返回执行错误详情
+//
+// 注意事项:
+//   - SQL 中的 Knowledge ID 会被自动替换为实际的数据表名
+//   - 查询结果默认以 Markdown 表格形式格式化输出
+//   - 所有修改类操作（INSERT/UPDATE/DELETE/CREATE/DROP 等）均被禁止
+//   - 建议在生产环境启用所有安全验证选项
+//
+// 示例:
+//   result, err := tool.Execute(ctx, []byte(`{
+//       "KnowledgeID": "sales_data_2024",
+//       "Sql": "SELECT * FROM sales_data_2024 WHERE amount > 1000"
+//   }`))
+
 // Execute executes the SQL query on DuckDB (only read-only queries are allowed)
 func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*types.ToolResult, error) {
 	logger.Infof(ctx, "[Tool][DataAnalysis] Execute started for session: %s", t.sessionID)
