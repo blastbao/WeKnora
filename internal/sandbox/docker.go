@@ -33,6 +33,22 @@ func (s *DockerSandbox) Type() SandboxType {
 	return SandboxTypeDocker
 }
 
+// IsAvailable 检查 Docker 是否可用
+//
+// 检查逻辑：
+//   1. 执行 "docker version" 命令
+//   2. 如果命令执行成功，说明 Docker 守护进程正在运行
+//   3. 如果命令失败，返回 false
+//
+// 参数：
+//   ctx - 上下文（支持超时控制）
+//
+// 返回值：
+//   bool - true: Docker 可用; false: Docker 不可用
+//
+// 注意：
+//   该函数只检查 Docker 命令是否可用，不检查镜像是否存在
+
 // IsAvailable checks if Docker is available
 func (s *DockerSandbox) IsAvailable(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, "docker", "version")
@@ -41,6 +57,22 @@ func (s *DockerSandbox) IsAvailable(ctx context.Context) bool {
 	}
 	return true
 }
+
+// Execute 在 Docker 容器中运行脚本，提供高级别的资源隔离和安全防护。
+//
+// 该方法通过构建复杂的 `docker run` 参数来实现多维度安全限制：
+//   - 资源隔离：强制限制 CPU 使用率、内存上限及禁用 Swap。
+//   - 权限限制：以非 root 用户运行，剥夺所有 Capabilities，禁止权限提升。
+//   - 文件系统：根文件系统只读，仅挂载必要的脚本目录并设为只读。
+//   - 网络安全：默认禁用网络访问。
+//   - 进程防护：设置 PID 限制，防止 Fork 炸弹攻击。
+//
+// 参数：
+//   ctx - 生命周期上下文，用于控制整个 Docker 命令的执行时长。
+//   config - 包含脚本内容、资源限制（CPU/内存）及环境配置。
+//
+// 返回：
+//   *ExecuteResult - 包含容器输出、耗时及详细的退出状态。
 
 // Execute runs a script in a Docker container
 func (s *DockerSandbox) Execute(ctx context.Context, config *ExecuteConfig) (*ExecuteResult, error) {
@@ -99,6 +131,41 @@ func (s *DockerSandbox) Execute(ctx context.Context, config *ExecuteConfig) (*Ex
 
 	return result, nil
 }
+
+// buildDockerArgs 构建 `docker run` 命令的参数列表，核心在于安全加固。
+//
+// 安全特性配置：
+//   - --rm: 容器退出后立即自动清理，防止资源残留。
+//   - --user: 指定 1000:1000 非特权用户运行。
+//   - --cap-drop ALL: 移除所有内核能力，防止突破容器限制。
+//   - --pids-limit: 限制进程总数，抵御恶意并发进程请求。
+//   - --tmpfs: 使用内存临时文件系统替代磁盘写入，并设置 noexec 权限。
+//   - --network none: 实现物理级的网络断开隔离。
+//
+// 示例输出：
+//   ["run", "--rm", "--user", "1000:1000", "--cap-drop", "ALL",
+//    "--memory", "536870912", "--cpus", "1.0", "--network", "none",
+//    "-v", "/home/sandbox:/workspace:ro", "-w", "/workspace",
+//    "sandbox:latest", "python3", "test.py", "--verbose"]
+//
+// docker run \
+//  --rm \
+//  --user 1000:1000 \
+//  --cap-drop ALL \
+//  --read-only \
+//  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+//  --memory 536870912 \
+//  --memory-swap 536870912 \
+//  --cpus 1.0 \
+//  --network none \
+//  --pids-limit 100 \
+//  --security-opt no-new-privileges \
+//  -v /home/user/scripts:/workspace:ro \
+//  -w /workspace \
+//  -e DEBUG=true \
+//  -e LOG_LEVEL=info \
+//  sandbox:latest \
+//  python3 test.py --arg1 value1
 
 // buildDockerArgs constructs the docker run command arguments
 func (s *DockerSandbox) buildDockerArgs(config *ExecuteConfig) []string {
@@ -193,6 +260,11 @@ func (s *DockerSandbox) ImageExists(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", s.config.DockerImage)
 	return cmd.Run() == nil
 }
+
+// EnsureImage 确保配置的 Docker 镜像在本地可用。
+//
+// 如果本地不存在该镜像，将尝试从远程仓库拉取（docker pull）。
+// 该方法通常在系统启动阶段调用，以避免在脚本首次执行时因拉取镜像导致响应超时。
 
 // EnsureImage pulls the Docker image if it doesn't exist locally.
 // This is intended to be called during initialization so the image is
