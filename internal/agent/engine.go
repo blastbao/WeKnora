@@ -798,7 +798,7 @@ func (e *AgentEngine) streamLLMToEventBus(
 ) (string, []types.LLMToolCall, error) {
 	logger.Debugf(ctx, "[Agent][Stream] Starting LLM stream with %d messages", len(messages))
 
-	stream, err := e.chatModel.ChatStream(ctx, messages, opts)
+	streamCh, err := e.chatModel.ChatStream(ctx, messages, opts)
 	if err != nil {
 		logger.Errorf(ctx, "[Agent][Stream] Failed to start LLM stream: %v", err)
 		return "", nil, err
@@ -808,7 +808,7 @@ func (e *AgentEngine) streamLLMToEventBus(
 	var toolCalls []types.LLMToolCall
 	chunkCount := 0
 
-	for chunk := range stream {
+	for chunk := range streamCh {
 		chunkCount++
 
 		if chunk.Content != "" {
