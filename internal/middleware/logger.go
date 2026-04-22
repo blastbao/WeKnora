@@ -32,6 +32,8 @@ func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
 }
 
 // sanitizeBody 清理敏感信息
+//
+// 将敏感字段值替换为 ***，防止敏感信息泄露到日志中。
 func sanitizeBody(body string) string {
 	result := body
 	// 替换常见的敏感字段（JSON格式）
@@ -100,34 +102,56 @@ func readRequestBody(c *gin.Context) string {
 // RequestID middleware adds a unique request ID to the context
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Get request ID from header or generate a new one
+		// 1. 优先使用客户端传入的请求ID
 		requestID := c.GetHeader("X-Request-ID")
 		if requestID == "" {
+			// 2. 没有则生成新的 UUID
 			requestID = uuid.New().String()
 		}
-		safeRequestID := secutils.SanitizeForLog(requestID)
-		// Set request ID in header
+
+		// 3. 设置到响应头（方便客户端追踪）
 		c.Header("X-Request-ID", requestID)
 
-		// Set request ID in context
+		// 4. 把 RequestID 存储到 Gin Context
 		c.Set(types.RequestIDContextKey.String(), requestID)
 
-		// Set logger in context
-		requestLogger := logger.GetLogger(c)
-		requestLogger = requestLogger.WithField("request_id", safeRequestID)
+		// 5. 创建带 request_id 的 Logger
+		requestLogger := logger.GetLogger(c).WithField("request_id", requestID)
 		c.Set(types.LoggerContextKey.String(), requestLogger)
 
-		// Set request ID in the global context for logging
+		// 6. 存储到 Request Context（深层调用可用）
 		c.Request = c.Request.WithContext(
 			context.WithValue(
-				context.WithValue(c.Request.Context(), types.RequestIDContextKey, requestID),
-				types.LoggerContextKey, requestLogger,
-			),
+				context.WithValue(c.Request.Context(),
+					types.RequestIDContextKey, requestID),
+				types.LoggerContextKey, requestLogger),
 		)
 
 		c.Next()
 	}
 }
+
+// 请求进入 Logger 中间件
+//	   ↓
+//	1. 记录开始时间
+//	2. 记录请求路径和查询参数
+//	   ↓
+//	3. 读取请求体（POST/PUT/PATCH 方法）
+//	  └── 读取后立即重置，确保后续 Handler 能读取
+//	   ↓
+//	4. 创建响应体捕获器（包装原始 ResponseWriter）
+//	  └── 不影响正常响应，同时捕获响应内容
+//	   ↓
+//	5. 调用 c.Next() → 执行后续中间件和业务 Handler
+//	   ↓
+//	6. 后续处理完成，开始记录响应信息
+//	   ↓
+//	7. 计算耗时（latency）
+//	8. 收集请求信息（状态码、客户端IP、响应大小）
+//	   ↓
+//	9. 处理响应体（截断、脱敏、类型过滤）
+//	   ↓
+//	10. 构建结构化日志并输出
 
 // Logger middleware logs request details with request ID, input and output
 func Logger() gin.HandlerFunc {

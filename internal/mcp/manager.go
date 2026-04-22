@@ -34,6 +34,26 @@ func NewMCPManager() *MCPManager {
 	return manager
 }
 
+// 执行流程
+//
+// 	1. 检查 mcp 服务是否启用
+//	  ↓
+//	2. 检查传输类型（Stdio 已禁用）
+//	  ↓
+//	3. 读锁检查：客户端是否存在且已连接？
+//	  ├── 是 → 直接返回（复用连接）
+//	  └── 否 → 继续
+//	  ↓
+//	4. 写锁获取（双重检查）
+//	  ├── 再次检查是否已存在（防止竞态）
+//	  └── 创建新客户端
+//	  ↓
+//	5. 建立连接
+//	  ↓
+//	6. 初始化握手
+//	  ↓
+//	7. 存储到映射表
+
 // GetOrCreateClient gets an existing client or creates a new one
 // Caches and reuses existing connections for SSE/HTTP Streamable
 // Note: Stdio transport is disabled for security reasons

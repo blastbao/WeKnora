@@ -52,6 +52,26 @@ type RouterParams struct {
 	OrganizationHandler   *handler.OrganizationHandler
 }
 
+// 中间件执行顺序
+//
+// 	请求进入
+//	   ↓
+//	1. CORS（跨域处理）
+//	   ↓
+//	2. RequestID（生成请求ID）
+//	   ↓
+//	3. Logger（记录日志）
+//	   ↓
+//	4. Recovery（异常恢复）
+//	   ↓
+//	5. ErrorHandler（错误处理）
+//	   ↓
+//	6. Auth（JWT认证）
+//	   ↓
+//	7. Tracing（链路追踪）
+//	   ↓
+//	业务处理
+
 // NewRouter 创建新的路由
 func NewRouter(params RouterParams) *gin.Engine {
 	r := gin.New()
@@ -122,6 +142,16 @@ func NewRouter(params RouterParams) *gin.Engine {
 }
 
 // RegisterChunkRoutes 注册分块相关的路由
+//
+// 路由列表：
+//   GET    /chunks/:knowledge_id                    # 获取分块列表
+//   GET    /chunks/by-id/:id                        # 通过ID获取单个分块
+//   DELETE /chunks/:knowledge_id/:id                # 删除分块
+//   DELETE /chunks/:knowledge_id                    # 删除知识下所有分块
+//   PUT    /chunks/:knowledge_id/:id                # 更新分块信息
+//   DELETE /chunks/by-id/:id/questions              # 删除生成的问题
+
+// RegisterChunkRoutes 注册分块相关的路由
 func RegisterChunkRoutes(r *gin.RouterGroup, handler *handler.ChunkHandler) {
 	// 分块路由组
 	chunks := r.Group("/chunks")
@@ -140,6 +170,29 @@ func RegisterChunkRoutes(r *gin.RouterGroup, handler *handler.ChunkHandler) {
 		chunks.DELETE("/by-id/:id/questions", handler.DeleteGeneratedQuestion)
 	}
 }
+
+// RegisterKnowledgeRoutes 注册知识相关的路由
+//
+// 路由列表：
+//
+//   # 知识库下的知识（嵌套资源）
+//   POST   /knowledge-bases/:id/knowledge/file    # 从文件创建知识
+//   POST   /knowledge-bases/:id/knowledge/url     # 从URL创建知识
+//   POST   /knowledge-bases/:id/knowledge/manual  # 手工录入知识
+//   GET    /knowledge-bases/:id/knowledge         # 获取知识列表
+//
+//   # 知识直接操作
+//   GET    /knowledge/batch                       # 批量获取知识
+//   GET    /knowledge/:id                         # 获取知识详情
+//   PUT    /knowledge/:id                         # 更新知识
+//   PUT    /knowledge/manual/:id                  # 更新手工知识
+//   DELETE /knowledge/:id                         # 删除知识
+//   POST   /knowledge/:id/reparse                 # 重新解析知识
+//   GET    /knowledge/:id/download                # 下载知识文件
+//   PUT    /knowledge/tags                        # 批量更新知识标签
+//   GET    /knowledge/search                      # 搜索知识
+//   PUT    /knowledge/image/:id/:chunk_id         # 更新图像分块信息
+//
 
 // RegisterKnowledgeRoutes 注册知识相关的路由
 func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandler) {
@@ -183,6 +236,26 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 }
 
 // RegisterFAQRoutes 注册 FAQ 相关路由
+//
+// 路由列表：
+//   # 条目管理
+//   GET    /knowledge-bases/:id/faq/entries                    			# 列表
+//   GET    /knowledge-bases/:id/faq/entries/export             			# 导出
+//   GET    /knowledge-bases/:id/faq/entries/:entry_id          			# 详情
+//   POST   /knowledge-bases/:id/faq/entries                    			# 批量创建
+//   POST   /knowledge-bases/:id/faq/entry                      			# 单个创建
+//   PUT    /knowledge-bases/:id/faq/entries/:entry_id          			# 更新
+//   POST   /knowledge-bases/:id/faq/entries/:entry_id/similar-questions  	# 添加相似问题
+//   PUT    /knowledge-bases/:id/faq/entries/fields             			# 批量更新字段
+//   PUT    /knowledge-bases/:id/faq/entries/tags               			# 批量更新标签
+//   DELETE /knowledge-bases/:id/faq/entries                    			# 批量删除
+//
+//   # 搜索和导入
+//   POST   /knowledge-bases/:id/faq/search                     # 搜索FAQ
+//   PUT    /knowledge-bases/:id/faq/import/last-result/display # 更新导入结果显示状态
+//   GET    /faq/import/progress/:task_id                       # 获取导入进度
+
+// RegisterFAQRoutes 注册 FAQ 相关路由
 func RegisterFAQRoutes(r *gin.RouterGroup, handler *handler.FAQHandler) {
 	if handler == nil {
 		return
@@ -212,6 +285,18 @@ func RegisterFAQRoutes(r *gin.RouterGroup, handler *handler.FAQHandler) {
 }
 
 // RegisterKnowledgeBaseRoutes 注册知识库相关的路由
+//
+// 路由列表：
+//   POST   /knowledge-bases                    		# 创建知识库
+//   GET    /knowledge-bases                    		# 获取知识库列表
+//   GET    /knowledge-bases/:id                		# 获取知识库详情
+//   PUT    /knowledge-bases/:id                		# 更新知识库
+//   DELETE /knowledge-bases/:id                		# 删除知识库
+//   GET    /knowledge-bases/:id/hybrid-search  		# 混合搜索
+//   POST   /knowledge-bases/copy               		# 复制知识库
+//   GET    /knowledge-bases/copy/progress/:task_id  	# 获取复制进度
+
+// RegisterKnowledgeBaseRoutes 注册知识库相关的路由
 func RegisterKnowledgeBaseRoutes(r *gin.RouterGroup, handler *handler.KnowledgeBaseHandler) {
 	// 知识库路由组
 	kb := r.Group("/knowledge-bases")
@@ -235,6 +320,14 @@ func RegisterKnowledgeBaseRoutes(r *gin.RouterGroup, handler *handler.KnowledgeB
 	}
 }
 
+// RegisterKnowledgeTagRoutes 注册知识库标签相关的路由
+//
+// 路由列表：
+//   GET    /knowledge-bases/:id/tags        	# 获取标签列表
+//   POST   /knowledge-bases/:id/tags        	# 创建标签
+//   PUT    /knowledge-bases/:id/tags/:tag_id  	# 更新标签
+//   DELETE /knowledge-bases/:id/tags/:tag_id  	# 删除标签
+
 // RegisterKnowledgeTagRoutes 注册知识库标签相关路由
 func RegisterKnowledgeTagRoutes(r *gin.RouterGroup, tagHandler *handler.TagHandler) {
 	if tagHandler == nil {
@@ -250,6 +343,12 @@ func RegisterKnowledgeTagRoutes(r *gin.RouterGroup, tagHandler *handler.TagHandl
 }
 
 // RegisterMessageRoutes 注册消息相关的路由
+//
+// 路由列表：
+//   GET    /messages/:session_id/load    # 加载更早的消息（向上滚动）
+//   DELETE /messages/:session_id/:id     # 删除消息
+
+// RegisterMessageRoutes 注册消息相关的路由
 func RegisterMessageRoutes(r *gin.RouterGroup, handler *handler.MessageHandler) {
 	// 消息路由组
 	messages := r.Group("/messages")
@@ -260,6 +359,19 @@ func RegisterMessageRoutes(r *gin.RouterGroup, handler *handler.MessageHandler) 
 		messages.DELETE("/:session_id/:id", handler.DeleteMessage)
 	}
 }
+
+// RegisterSessionRoutes 注册会话相关的路由
+//
+// 路由列表：
+//   POST   /sessions                                 # 创建会话
+//   GET    /sessions                                 # 获取租户会话列表
+//   GET    /sessions/:id                             # 获取会话详情
+//   PUT    /sessions/:id                             # 更新会话
+//   DELETE /sessions/:id                             # 删除会话
+//   DELETE /sessions/batch                           # 批量删除会话
+//   POST   /sessions/:session_id/generate_title      # 生成会话标题
+//   POST   /sessions/:session_id/stop                # 停止会话
+//   GET    /sessions/continue-stream/:session_id     # 继续接收流式响应
 
 // RegisterSessionRoutes 注册路由
 func RegisterSessionRoutes(r *gin.RouterGroup, handler *session.Handler) {
@@ -277,6 +389,18 @@ func RegisterSessionRoutes(r *gin.RouterGroup, handler *session.Handler) {
 		sessions.GET("/continue-stream/:session_id", handler.ContinueStream)
 	}
 }
+
+// RegisterChatRoutes 注册聊天相关的路由
+//
+// 路由列表：
+//   # 知识问答
+//   POST /knowledge-chat/:session_id    # 基于知识库的问答
+//
+//   # Agent问答
+//   POST /agent-chat/:session_id        # 基于Agent的问答
+//
+//   # 知识检索（无需session）
+//   POST /knowledge-search              # 知识检索接口
 
 // RegisterChatRoutes 注册路由
 func RegisterChatRoutes(r *gin.RouterGroup, handler *session.Handler) {
@@ -297,6 +421,24 @@ func RegisterChatRoutes(r *gin.RouterGroup, handler *session.Handler) {
 		knowledgeSearch.POST("", handler.SearchKnowledge)
 	}
 }
+
+// RegisterTenantRoutes 注册租户相关的路由
+//
+// 路由列表：
+//   # 租户管理
+//   POST   /tenants           # 创建租户
+//   GET    /tenants           # 获取租户列表
+//   GET    /tenants/:id       # 获取租户详情
+//   PUT    /tenants/:id       # 更新租户
+//   DELETE /tenants/:id       # 删除租户
+//
+//   # 跨租户操作（需要特殊权限）
+//   GET    /tenants/all       # 获取所有租户
+//   GET    /tenants/search    # 搜索租户
+//
+//   # KV配置管理（租户级）
+//   GET    /tenants/kv/:key   # 获取KV配置
+//   PUT    /tenants/kv/:key   # 更新KV配置
 
 // RegisterTenantRoutes 注册租户相关的路由
 func RegisterTenantRoutes(r *gin.RouterGroup, handler *handler.TenantHandler) {
@@ -321,6 +463,16 @@ func RegisterTenantRoutes(r *gin.RouterGroup, handler *handler.TenantHandler) {
 }
 
 // RegisterModelRoutes 注册模型相关的路由
+//
+// 路由列表：
+//   GET    /models/providers   # 获取模型厂商列表
+//   POST   /models             # 创建模型
+//   GET    /models             # 获取模型列表
+//   GET    /models/:id         # 获取单个模型
+//   PUT    /models/:id         # 更新模型
+//   DELETE /models/:id         # 删除模型
+
+// RegisterModelRoutes 注册模型相关的路由
 func RegisterModelRoutes(r *gin.RouterGroup, handler *handler.ModelHandler) {
 	// 模型路由组
 	models := r.Group("/models")
@@ -340,6 +492,13 @@ func RegisterModelRoutes(r *gin.RouterGroup, handler *handler.ModelHandler) {
 	}
 }
 
+// RegisterEvaluationRoutes 注册评估相关的路由
+//
+// 路由列表：
+//
+//	POST /evaluation   # 执行评估任务
+//	GET  /evaluation   # 获取评估结果
+
 func RegisterEvaluationRoutes(r *gin.RouterGroup, handler *handler.EvaluationHandler) {
 	evaluationRoutes := r.Group("/evaluation")
 	{
@@ -347,6 +506,17 @@ func RegisterEvaluationRoutes(r *gin.RouterGroup, handler *handler.EvaluationHan
 		evaluationRoutes.GET("/", handler.GetEvaluationResult)
 	}
 }
+
+// RegisterAuthRoutes 注册认证相关的路由
+//
+// 路由列表：
+//   POST /auth/register       	# 用户注册
+//   POST /auth/login          	# 用户登录
+//   POST /auth/refresh        	# 刷新访问令牌
+//   GET  /auth/validate       	# 验证令牌有效性
+//   POST /auth/logout         	# 用户登出
+//   GET  /auth/me             	# 获取当前用户信息
+//   POST /auth/change-password # 修改密码
 
 // RegisterAuthRoutes registers authentication routes
 func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler) {
@@ -358,6 +528,34 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler) {
 	r.GET("/auth/me", handler.GetCurrentUser)
 	r.POST("/auth/change-password", handler.ChangePassword)
 }
+
+// RegisterInitializationRoutes 注册初始化相关的路由
+//
+// 路由列表：
+//   # 知识库配置
+//   GET    /initialization/config/:kbId        # 获取配置
+//   POST   /initialization/initialize/:kbId    # 初始化知识库
+//   PUT    /initialization/config/:kbId        # 更新配置
+//
+//   # Ollama 管理
+//   GET    /initialization/ollama/status                    # 检查状态
+//   GET    /initialization/ollama/models                    # 模型列表
+//   POST   /initialization/ollama/models/check              # 检查模型
+//   POST   /initialization/ollama/models/download           # 下载模型
+//   GET    /initialization/ollama/download/progress/:taskId # 下载进度
+//   GET    /initialization/ollama/download/tasks            # 任务列表
+//
+//   # 远程模型
+//   POST   /initialization/remote/check       # 检查远程模型
+//   POST   /initialization/embedding/test     # 测试Embedding模型
+//   POST   /initialization/rerank/check       # 检查Rerank模型
+//   POST   /initialization/multimodal/test    # 测试多模态功能
+//
+//   # 文本处理
+//   POST   /initialization/extract/text-relation  # 提取文本关系
+//   POST   /initialization/extract/fabri-tag      # 生成标签
+//   POST   /initialization/extract/fabri-text     # 生成文本
+//
 
 func RegisterInitializationRoutes(r *gin.RouterGroup, handler *handler.InitializationHandler) {
 	// 初始化接口
@@ -384,6 +582,12 @@ func RegisterInitializationRoutes(r *gin.RouterGroup, handler *handler.Initializ
 	r.POST("/initialization/extract/fabri-text", handler.FabriText)
 }
 
+// RegisterSystemRoutes 注册系统信息相关的路由
+//
+// 路由列表：
+//   GET /system/info              # 获取系统信息
+//   GET /system/minio/buckets     # 获取MinIO存储桶列表
+
 // RegisterSystemRoutes registers system information routes
 func RegisterSystemRoutes(r *gin.RouterGroup, handler *handler.SystemHandler) {
 	systemRoutes := r.Group("/system")
@@ -392,6 +596,20 @@ func RegisterSystemRoutes(r *gin.RouterGroup, handler *handler.SystemHandler) {
 		systemRoutes.GET("/minio/buckets", handler.ListMinioBuckets)
 	}
 }
+
+// RegisterMCPServiceRoutes 注册 MCP 服务相关的路由
+//
+// MCP (Model Context Protocol) 服务管理
+//
+// 路由列表：
+//   POST   /mcp-services             	# 创建MCP服务
+//   GET    /mcp-services              	# 获取服务列表
+//   GET    /mcp-services/:id          	# 获取服务详情
+//   PUT    /mcp-services/:id          	# 更新服务
+//   DELETE /mcp-services/:id          	# 删除服务
+//   POST   /mcp-services/:id/test     	# 测试服务连接
+//   GET    /mcp-services/:id/tools    	# 获取工具列表
+//   GET    /mcp-services/:id/resources # 获取资源列表
 
 // RegisterMCPServiceRoutes registers MCP service routes
 func RegisterMCPServiceRoutes(r *gin.RouterGroup, handler *handler.MCPServiceHandler) {
@@ -416,6 +634,11 @@ func RegisterMCPServiceRoutes(r *gin.RouterGroup, handler *handler.MCPServiceHan
 	}
 }
 
+// RegisterWebSearchRoutes 注册网页搜索相关的路由
+//
+// 路由列表：
+//   GET /web-search/providers   # 获取可用的搜索引擎提供商
+
 // RegisterWebSearchRoutes registers web search routes
 func RegisterWebSearchRoutes(r *gin.RouterGroup, webSearchHandler *handler.WebSearchHandler) {
 	// Web search providers
@@ -425,6 +648,20 @@ func RegisterWebSearchRoutes(r *gin.RouterGroup, webSearchHandler *handler.WebSe
 		webSearch.GET("/providers", webSearchHandler.GetProviders)
 	}
 }
+
+// RegisterCustomAgentRoutes 注册自定义 Agent 相关的路由
+//
+// 路由列表：
+//   # 占位符
+//   GET    /agents/placeholders        # 获取占位符定义
+//
+//   # Agent CRUD
+//   POST   /agents                     # 创建Agent
+//   GET    /agents                     # 获取Agent列表（含内置）
+//   GET    /agents/:id                 # 获取Agent详情
+//   PUT    /agents/:id                 # 更新Agent
+//   DELETE /agents/:id                 # 删除Agent
+//   POST   /agents/:id/copy            # 复制Agent
 
 // RegisterCustomAgentRoutes registers custom agent routes
 func RegisterCustomAgentRoutes(r *gin.RouterGroup, agentHandler *handler.CustomAgentHandler) {
@@ -447,6 +684,11 @@ func RegisterCustomAgentRoutes(r *gin.RouterGroup, agentHandler *handler.CustomA
 	}
 }
 
+// RegisterSkillRoutes 注册技能相关的路由
+//
+// 路由列表：
+//   GET /skills   # 获取预加载的技能列表
+
 // RegisterSkillRoutes registers skill routes
 func RegisterSkillRoutes(r *gin.RouterGroup, skillHandler *handler.SkillHandler) {
 	skills := r.Group("/skills")
@@ -455,6 +697,64 @@ func RegisterSkillRoutes(r *gin.RouterGroup, skillHandler *handler.SkillHandler)
 		skills.GET("", skillHandler.ListSkills)
 	}
 }
+
+// RegisterOrganizationRoutes 注册组织和资源共享相关的路由
+//
+// 功能模块：
+//   1. 组织管理（CRUD、成员管理、邀请机制）
+//   2. 资源共享（知识库共享、Agent共享）
+//   3. 公开资源访问
+//
+// 路由列表：
+//   # 组织管理
+//   POST   /organizations                                 # 创建组织
+//   GET    /organizations                                 # 我的组织列表
+//   GET    /organizations/preview/:code                   # 预览邀请码
+//   POST   /organizations/join                            # 通过邀请码加入
+//   POST   /organizations/join-request                    # 提交加入申请
+//   GET    /organizations/search                          # 搜索可加入的组织
+//   POST   /organizations/join-by-id                      # 通过ID加入
+//   GET    /organizations/:id                             # 获取组织详情
+//   PUT    /organizations/:id                             # 更新组织
+//   DELETE /organizations/:id                             # 删除组织
+//   POST   /organizations/:id/leave                       # 离开组织
+//   POST   /organizations/:id/request-upgrade             # 请求角色升级
+//
+//   # 邀请管理
+//   POST   /organizations/:id/invite-code                 # 生成邀请码
+//   GET    /organizations/:id/search-users                # 搜索用户（邀请用）
+//   POST   /organizations/:id/invite                      # 直接邀请成员
+//
+//   # 成员管理
+//   GET    /organizations/:id/members                     # 成员列表
+//   PUT    /organizations/:id/members/:user_id            # 更新成员角色
+//   DELETE /organizations/:id/members/:user_id            # 移除成员
+//
+//   # 申请审核
+//   GET    /organizations/:id/join-requests               # 申请列表
+//   PUT    /organizations/:id/join-requests/:request_id/review # 审核申请
+//
+//   # 知识库共享
+//   POST   /knowledge-bases/:id/shares                    # 共享知识库
+//   GET    /knowledge-bases/:id/shares                    # 共享列表
+//   PUT    /knowledge-bases/:id/shares/:share_id          # 更新权限
+//   DELETE /knowledge-bases/:id/shares/:share_id          # 取消共享
+//
+//   # Agent共享
+//   POST   /agents/:id/shares                             # 共享Agent
+//   GET    /agents/:id/shares                             # 共享列表
+//   DELETE /agents/:id/shares/:share_id                   # 取消共享
+//
+//   # 组织内资源视图
+//   GET    /organizations/:id/shares                      # 组织共享的知识库
+//   GET    /organizations/:id/agent-shares                # 组织共享的Agent
+//   GET    /organizations/:id/shared-knowledge-bases      # 组织内知识库（含个人）
+//   GET    /organizations/:id/shared-agents               # 组织内Agent（含个人）
+//
+//   # 公开资源
+//   GET    /shared-knowledge-bases                        # 公开知识库列表
+//   GET    /shared-agents                                 # 公开Agent列表
+//   POST   /shared-agents/disabled                        # 禁用公开Agent
 
 // RegisterOrganizationRoutes registers organization and sharing routes
 func RegisterOrganizationRoutes(r *gin.RouterGroup, orgHandler *handler.OrganizationHandler) {
