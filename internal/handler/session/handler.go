@@ -12,6 +12,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Handler 处理所有与对话会话相关的 HTTP 请求，包括会话的增删改查
+//  - 消息服务：管理会话中的消息
+//  - 会话服务：管理会话本身
+//  - 流管理器：处理SSE流式响应
+//  - 应用配置
+//  - 知识库服务：管理知识库
+//  - 自定义Agent服务：管理Agent配置
+//  - 租户服务：加载租户共享Agent上下文
+//  - Agent共享服务：解析共享Agent（检索时
+
 // Handler handles all HTTP requests related to conversation sessions
 type Handler struct {
 	messageService       interfaces.MessageService       // Service for managing messages
@@ -46,6 +56,15 @@ func NewHandler(
 		agentShareService:    agentShareService,
 	}
 }
+
+// CreateSession 创建新会话。
+//
+// 执行过程：
+//  1. 解析并验证请求体：将 JSON 请求绑定到 CreateSessionRequest 结构体，验证失败返回 400 错误。
+//  2. 从 gin 上下文中提取 tenant ID，不存在则返回 401 未授权错误。
+//  3. 构建 Session 对象：仅包含基础信息（tenant ID、标题、描述），会话本身与知识库解耦，所有配置在查询时由自定义 Agent 提供。
+//  4. 调用 sessionService.CreateSession 创建会话的持久化信息。
+//  5. 返回 201 状态码及创建的会话数据。
 
 // CreateSession godoc
 // @Summary      创建会话
@@ -110,6 +129,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	})
 }
 
+// GetSession 根据 ID 获取会话详情。
+//
+// 执行过程：
+//  1. 从 URL 路径参数中提取 session ID，并对 ID 进行日志安全过滤（SanitizeForLog）。
+//  2. 若 ID 为空，返回 400 参数错误。
+//  3. 调用 sessionService.GetSession 查询会话详情。
+//  4. 若返回 ErrSessionNotFound，返回 404 错误；其他错误返回 500。
+//  5. 返回 200 状态码及会话详情。
+
 // GetSession godoc
 // @Summary      获取会话详情
 // @Description  根据ID获取会话详情
@@ -157,6 +185,15 @@ func (h *Handler) GetSession(c *gin.Context) {
 	})
 }
 
+// GetSessionsByTenant 获取当前租户下的会话列表，支持分页查询。
+//
+// 执行过程：
+//  1. 从 URL 查询参数中解析分页信息（page、page_size），绑定到 types.Pagination。
+//  2. 解析失败返回 400 参数错误。
+//  3. 调用 sessionService.GetPagedSessionsByTenant 执行分页查询。
+//  4. 查询出错返回 500 内部错误。
+//  5. 返回 200 状态码，附带会话数据及分页元数据（total、page、page_size）。
+
 // GetSessionsByTenant godoc
 // @Summary      获取会话列表
 // @Description  获取当前租户的会话列表，支持分页
@@ -198,6 +235,17 @@ func (h *Handler) GetSessionsByTenant(c *gin.Context) {
 		"page_size": result.PageSize,
 	})
 }
+
+// UpdateSession 更新指定会话的属性。
+//
+// 执行过程：
+//  1. 从 URL 路径参数中提取 session ID，并做日志安全过滤；为空则返回 400。
+//  2. 从 gin 上下文中提取 tenant ID 用于鉴权，缺失则返回 401。
+//  3. 解析请求体 JSON 到 types.Session，失败返回 400。
+//  4. 将 URL 中的 session ID 与上下文中的 TenantID 注入到 session 对象，确保只能更新当前租户的数据。
+//  5. 调用 sessionService.UpdateSession 执行更新。
+//  6. 若会话不存在返回 404；其他错误返回 500。
+//  7. 返回 200 状态码及更新后的会话数据。
 
 // UpdateSession godoc
 // @Summary      更新会话

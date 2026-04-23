@@ -35,6 +35,92 @@ type qaRequestContext struct {
 	effectiveTenantID uint64 // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
 }
 
+// parseQARequest 解析并验证知识库问答请求，构建请求上下文对象
+//
+// 该函数是问答流程的入口点，负责解析HTTP请求、验证参数、加载会话、解析Agent配置、合并@提及的资源，
+// 并构建完整的请求上下文。
+//
+// 执行过程：
+// 1. 基础校验：从 URL 获取 SessionID，解析 JSON 请求体，校验 Query 内容非空
+// 2. 获取会话：调用 SessionService 获取会话详情，确保会话存在
+// 3. 解析智能体（Agent）：
+//    - 优先尝试通过 AgentShareService 解析共享智能体，若成功则记录有效租户ID（用于检索范围控制）
+//    - 若非共享智能体，则通过 CustomAgentService 获取自有智能体配置
+// 4. 处理 @提及逻辑（关键）：
+//    - 遍历请求中的 MentionedItems
+//    - 将 @提及的知识库（kb）ID 合并至 knowledgeBaseIDs 列表
+//    - 将 @提及的文件（file）ID 合并至 knowledgeIDs 列表
+//    - 目的：确保即使用户未在侧边栏勾选，只要 @ 了特定资源，检索时也会包含这些资源
+// 5. 构建上下文：封装 qaRequestContext 对象，包含会话、智能体、合并后的检索ID列表及用户配置，供后续流程使用
+
+// 执行流程 details ：
+//  1. 克隆上下文并记录日志（便于链路追踪）
+//  2. 从URL路径参数获取session_id并进行防注入清理
+//     - 验证非空，无效则返回400错误
+//  3. 解析JSON请求体到CreateKnowledgeQARequest结构体
+//     - 绑定失败返回400错误
+//  4. 验证查询内容（query）非空
+//  5. 记录请求日志（序列化为JSON并清理敏感信息）
+//  6. 调用sessionService获取会话信息
+//     - 会话不存在返回404错误
+//  7. 解析Agent配置（如果请求中指定了agent_id）：
+//     a) 优先尝试解析共享Agent：
+//        - 需要用户ID和租户ID都存在
+//        - 调用agentShareService.GetSharedAgentForUser获取共享Agent
+//        - 成功后记录effectiveTenantID（用于检索隔离）
+//     b) 如果共享Agent不存在，尝试获取自有Agent：
+//        - 调用customAgentService.GetAgentByID
+//     c) 两者都失败时记录警告日志，使用默认配置（customAgent保持nil）
+//  8. 合并@提及的资源到知识库ID和知识ID列表：
+//     a) 初始化kbIDs和knowledgeIDs切片及去重set
+//     b) 添加请求中原有的KnowledgeBaseIDs
+//     c) 添加请求中原有的KnowledgeIds
+//     d) 遍历MentionedItems，根据类型分别合并：
+//        - Type="kb"：合并到知识库ID列表
+//        - Type="file"：合并到知识ID列表
+//     e) 使用set去重，避免重复ID
+//  9. 记录合并结果日志（便于调试@提及功能）
+//  10. 构建qaRequestContext对象，包含：
+//      - 原始上下文和Gin上下文
+//      - 会话ID、请求ID、查询内容
+//      - 会话对象、自定义Agent配置
+//      - 助手消息对象（预创建，IsCompleted=false）
+//      - 合并后的知识库ID列表、知识ID列表
+//      - 摘要模型ID、Web搜索开关、记忆开关
+//      - @提及项、生效租户ID（用于共享Agent场景）
+//  11. 返回请求上下文和原始请求对象
+//
+// 参数：
+//   - c: Gin上下文，包含HTTP请求信息和参数
+//   - logPrefix: 日志前缀，用于区分不同调用场景（如"KnowledgeQA"或"AgentQA"）
+//
+// 返回值：
+//   - *qaRequestContext: 构建好的请求上下文对象，包含后续处理所需的所有数据
+//   - *CreateKnowledgeQARequest: 原始解析的请求对象，供调用方进一步使用
+//   - error: 校验失败时的错误信息（400/404等）
+//
+// 核心特性：
+//   1. 防注入：所有用户输入的ID都经过secutils.SanitizeForLog清理
+//   2. 共享Agent支持：自动识别并解析共享Agent，设置正确的检索租户隔离
+//   3. @提及资源合并：自动将用户在消息中@的知识库/文件合并到检索目标中
+//      - 解决用户只在输入框@提及但未在侧边栏选择KB的问题
+//   4. 配置降级：Agent获取失败时使用默认配置，不影响主流程
+//   5. 租户隔离：共享Agent场景下设置effectiveTenantID确保数据安全
+//
+// 支持的@提及类型：
+//   - "kb" (Knowledge Base)：知识库，合并到KnowledgeBaseIDs
+//   - "file"：文件/文档，合并到KnowledgeIDs
+//
+// 示例场景：
+//   用户输入："@项目文档 介绍一下这个项目"，同时侧边栏未选择任何知识库
+//   - request.MentionedItems = [{ID:"kb_123", Type:"kb", Name:"项目文档"}]
+//   - 合并后kbIDs = ["kb_123"]，确保检索会搜索该知识库
+//
+// 注意事项：
+//   - 助手消息对象仅创建占位，实际持久化由调用方执行
+//   - customAgent为nil时表示使用系统默认Agent配置
+//   - effectiveTenantID仅在共享Agent场景下非0，用于覆盖当前租户ID（检索数据隔离）
+
 // parseQARequest parses and validates a QA request, returns the request context
 func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestContext, *CreateKnowledgeQARequest, error) {
 	ctx := logger.CloneContext(c.Request.Context())
