@@ -260,6 +260,69 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 	return nil
 }
 
+// GenerateTitle
+//	│
+//	├── 1. 校验 session
+//	│      → 如果 session == nil，直接报错返回
+//	│      → 标题生成必须依赖一个有效会话对象
+//	│
+//	├── 2. 如果 session 已经有标题，直接返回
+//	│      → 避免重复生成
+//	│      → 这一步是一个短路优化
+//	│
+//	├── 3. 找“首条用户消息”
+//	│      → 标题生成的输入核心不是整段会话，而是第一条 user message
+//	│      → 分两种情况：
+//	│
+//	│      ├── 3.1 如果调用方没传 messages
+//	│      │      → 从 messageRepo.GetFirstMessageOfUser(ctx, session.ID) 查询数据库
+//	│      │      → 找该会话第一条用户消息
+//	│      │
+//	│      └── 3.2 如果调用方传了 messages
+//	│             → 遍历 messages
+//	│             → 找到第一条 role == "user" 的消息
+//	│
+//	├── 4. 校验是否找到 user message
+//	│      → 如果 message == nil
+//	│      → 说明没有可用于起标题的用户输入
+//	│      → 直接报错返回
+//	│
+//	├── 5. 选择标题生成模型 modelID
+//	│      → 如果调用方显式传了 modelID，直接使用
+//	│      → 否则：
+//	│           调 modelService.ListModels(ctx) 找第一 个 Type == KnowledgeQA 的模型
+//	│      → 如果最终还是没找到模型，报错返回
+//	│
+//	├── 6. 获取 chatModel
+//	│      → 调 modelService.GetChatModel(ctx, modelID)
+//	│      → 拿到真正用于生成标题的聊天模型实例
+//	│
+//	├── 7. 组装标题生成用的 chatMessages
+//	│      → system message：
+//	│           使用 s.cfg.Conversation.GenerateSessionTitlePrompt
+//	│      → user message：
+//	│           使用“首条用户消息”的 Content
+//	│      → 这一步本质上是在对模型说：
+//	│           “请根据这条用户输入，帮我生成一个会话标题”
+//	│
+//	├── 8. 调用模型生成标题
+//	│      → thinking = false
+//	│      → chatModel.Chat(ctx, chatMessages, &chat.ChatOptions{...})
+//	│      → Temperature = 0.3
+//	│      → 目标是让标题相对稳定、简洁，不要太发散
+//	│
+//	├── 9. 处理模型返回结果
+//	│      → 从 response.Content 取出模型输出
+//	│      → 去掉可能残留的 "<think>\n\n</think>" 前缀
+//	│      → 赋值给 session.Title
+//	│
+//	├── 10. 持久化标题
+//	│       → 调 sessionRepo.Update(ctx, session)
+//	│       → 把新标题写回数据库
+//	│
+//	└── 11. 返回 session.Title
+//		  → 返回最终生成并保存好的标题
+
 // GenerateTitle generates a title for the current conversation content
 // modelID: optional model ID to use for title generation (if empty, uses first available KnowledgeQA model)
 func (s *sessionService) GenerateTitle(ctx context.Context,
@@ -365,6 +428,21 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 
 	return session.Title, nil
 }
+
+// 当用户发起一个新对话（会话尚无标题）时，该函数 异步生成会话标题 。
+//
+// GenerateTitleAsync
+//	│
+//	├── 1. 在 goroutine 中异步执行（不阻塞主请求）
+//	├── 2. 获取第一条用户消息（userQuery）
+//	├── 3. 调用 GenerateTitle：
+//	│   ├── 选用模型（优先用 Agent 指定的 modelID，否则找第一个 KnowledgeQA 模型）
+//	│   ├── 构造 Prompt（系统提示词 + 用户消息）
+//	│   └── 调用 LLM 生成简短标题
+//	│
+//	└── 4. 生成成功后：
+//	   ├── 发布 EventSessionTitle 到 EventBus
+//	   └── AgentStreamHandler 接收 → 推送到 SSE 流 → 前端展示
 
 // GenerateTitleAsync generates a title for the session asynchronously
 // This method clones the session and generates the title in a goroutine
@@ -1548,6 +1626,114 @@ func (s *sessionService) SearchKnowledge(ctx context.Context,
 //
 // 该函数是Agent模式问答的核心入口，支持自定义Agent配置、多轮对话、 知识库检索、MCP工具调用、网络搜索等高级功能。
 // 通过EventBus实现流式事件输出，适用于需要复杂推理和工具调用的场景。
+
+// AgentQA
+//	│
+//	├── 1. 校验 session / customAgent
+//	│      → 读取 sessionID
+//	│      → 检查 customAgent 是否存在
+//	│      → 没有自定义 Agent 就直接报错返回
+//	│
+//	├── 2. 确定 Agent 所属租户 agentTenantID
+//	│      → 优先使用 customAgent.TenantID
+//	│      → 否则回退到 session.TenantID
+//	│      → 这一点对共享 Agent 很关键
+//	│
+//	├── 3. 加载租户信息 tenantInfo
+//	│      → 先尝试从 ctx 中拿 TenantInfo
+//	│      → 如果当前上下文租户和 Agent 所属租户不一致
+//	│      → 再去 tenantService 加载 Agent 对应租户信息
+//	│      → 目的是后续正确解析模型 / 知识库 / WebSearch 配置
+//	│
+//	├── 4. 生成运行时 AgentConfig
+//	│      → customAgent.EnsureDefaults()
+//	│      → 把 customAgent.Config 映射成运行时 agentConfig
+//	│      → 包含 MaxIterations / Temperature / WebSearch / MCP / Thinking / MultiTurn 等
+//	│      → 同时注入 Skills 配置
+//	│
+//	├── 5. 解析本轮知识库范围
+//	│      → 如果用户本轮 @ 提到了 KB / 文件
+//	│           用本轮请求里的 knowledgeBaseIDs / knowledgeIDs 覆盖 Agent 默认配置
+//	│      → 如果开启了 RetrieveKBOnlyWhenMentioned 且本轮没 @
+//	│           直接禁用 KB 检索
+//	│      → 否则使用 Agent 预设知识库
+//	│
+//	├── 6. 解析可用工具与系统提示词
+//	│      → AllowedTools: 优先 customAgent.Config.AllowedTools
+//	│      → 否则使用系统默认工具
+//	│      → 如果配置了 SystemPrompt，则启用自定义系统提示词
+//	│
+//	├── 7. 处理 WebSearch 配置
+//	│      → 设置 WebSearchMaxResults
+//	│      → 如果 Agent 自己没配，则尝试使用 tenantInfo 里的默认值
+//	│
+//	├── 8. 构建 SearchTargets
+//	│      → 根据 agentTenantID + KnowledgeBases + KnowledgeIDs
+//	│      → 调 buildSearchTargets()
+//	│      → 生成底层检索目标，供工具或检索链路使用
+//	│
+//	├── 9. 确定主模型 effectiveModelID
+//	│      → 优先使用请求传入的 summaryModelID
+//	│      → 否则使用 customAgent.Config.ModelID
+//	│      → 这个模型实际上是 Agent 的主推理模型
+//	│      → 负责思考 / 决策 / 工具调度 / 最终回答
+//	│
+//	├── 10. 获取 summaryModel
+//	│       → 调 modelService.GetChatModel()
+//	│       → 得到 Agent 运行所需的聊天模型实例
+//	│
+//	├── 11. 按需获取 rerankModel
+//	│       → 只有配置了知识库时才需要
+//	│       → 没有知识库就是 pure agent mode，可跳过
+//	│
+//	├── 12. 获取或创建 contextManager
+//	│       → contextManager 负责这个 session 的上下文管理
+//	│       → 包括历史消息、压缩、系统提示词维护等
+//	│
+//	├── 13. 设置当前 Agent 的 system prompt
+//	│       → 通过 contextManager.SetSystemPrompt()
+//	│       → 保证本轮上下文使用的是当前 Agent 的身份设定
+//	│
+//	├── 14. 加载历史上下文 llmContext
+//	│       → 通过 getContextForSession() 取出历史消息
+//	│       → 如果失败则降级为空历史
+//	│
+//	├── 15. 应用多轮配置 MultiTurnEnabled
+//	│       → 如果关闭多轮对话
+//	│       → 直接清空 llmContext
+//	│       → 让 Agent 只看当前 query，不参考历史
+//	│
+//	├── 16. 创建 AgentEngine
+//	│       → 调 agentService.CreateAgentEngine()
+//	│       → 注入：
+//	│           1) agentConfig
+//	│           2) summaryModel
+//	│           3) rerankModel
+//	│           4) eventBus
+//	│           5) contextManager
+//	│           6) sessionID
+//	│       → 生成可执行的 Agent 引擎实例
+//	│
+//	├── 17. 执行 engine.Execute()
+//	│       → 输入：sessionID / assistantMessageID / query / llmContext
+//	│       → 进入 Agent ReAct 循环
+//	│       → 在执行过程中通过 eventBus emit 各类事件：
+//	│           - thought
+//	│           - tool_call
+//	│           - tool_result
+//	│           - references
+//	│           - final_answer
+//	│           - complete
+//	│
+//	├── 18. 执行失败时 emit error 事件
+//	│       → 如果 engine.Execute() 出错
+//	│       → 向 eventBus 发 EventError
+//	│       → 交给后续 SSE 链路处理
+//	│
+//	└── 19. 返回 nil
+//		  → AgentQA 自己不直接返回回答文本
+//		  → 它的产出通过 EventBus 流式发送出去
+//		  → Handler 层会订阅这些事件并继续推送到前端
 
 // AgentQA performs agent-based question answering with conversation history and streaming support
 // customAgent is optional - if provided, uses custom agent configuration instead of tenant defaults

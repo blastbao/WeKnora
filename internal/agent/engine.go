@@ -132,57 +132,69 @@ func (e *AgentEngine) GetSkillsManager() *skills.Manager {
 
 // Execute 执行智能体（Agent）的核心推理与任务处理流程。
 //
-// 该函数负责协调上下文构建、系统提示词生成、工具注册以及多轮推理循环，直到任务完成或达到最大轮次限制。
-//
-// 执行过程详解：
-// 1. **初始化与日志记录**：
-//    - 记录会话 ID、消息 ID、用户查询内容 Query 及上下文长度。
-//    - 发送 "execute_start" 管道事件，标记执行开始。
-//    - 注册延迟清理函数 (defer)，确保在函数退出时清理所有已注册的工具资源。
-//
-// 2. **状态初始化**：
-//    - 创建并初始化 `AgentState` 对象，用于存储推理过程中的步骤历史 (`RoundSteps`)、
-//      知识引用 (`KnowledgeRefs`)、当前轮次 (`CurrentRound`) 及完成状态 (`IsComplete`)。
-//
-// 3. **系统提示词构建 (System Prompt Construction)**：
-//    - 检查技能管理器 (`skillsManager`) 是否启用。
-//    - **若启用**：获取所有技能元数据，调用 `BuildSystemPromptWithOptions` 构建包含技能信息（渐进式披露 Level 1）的系统提示词。
-//    - **若未启用**：调用标准 `BuildSystemPrompt` 构建基础系统提示词。
-//    - 记录生成的提示词长度及内容（调试级别）。
-//
-// 4. **消息上下文组装**：
-//    - 调用 `buildMessagesWithLLMContext` 将系统提示词、历史对话 (`llmContext`) 和当前用户查询 (`query`) 组装成大模型所需的完整消息列表。
-//    - 记录最终发送给 LLM 的消息总数。
-//
-// 5. **工具定义准备**：
-//    - 调用 `buildToolsForLLM` 获取当前可用的工具定义列表，用于支持大模型的 Function Calling。
-//    - 记录启用的工具数量及名称列表，并发送 "tools_ready" 管道事件。
-//
-// 6. **执行推理循环 (Execution Loop)**：
-//    - 调用 `executeLoop` 进入核心推理循环。在此循环中，Agent 将根据当前状态调用 LLM，
-//      解析工具调用请求，执行具体工具，并将结果反馈给 LLM，直至任务标记为完成。
-//
-// 7. **错误处理**：
-//    - 若 `executeLoop` 返回错误，记录错误日志。
-//    - 通过事件总线 (`eventBus`) 发射 `EventError` 类型事件，包含错误详情及阶段信息 ("agent_execution")。
-//    - 直接返回错误，不返回状态对象。
-//
-// 8. **成功完成与收尾**：
-//    - 若执行成功，记录 "Agent Execution Completed Successfully" 日志。
-//    - 输出统计信息：总轮次、步骤数、完成状态。
-//    - 发送 "execute_complete" 管道事件，包含最终执行统计数据。
-//    - 返回最终的 `AgentState` 对象及 nil 错误。
-//
-// 参数:
-//   - ctx: 上下文控制，用于超时控制和链路追踪。
-//   - sessionID: 当前会话的唯一标识符。
-//   - messageID: 当前用户消息的唯一标识符。
-//   - query: 用户的原始输入查询字符串。
-//   - llmContext: 历史对话消息列表，用于维持多轮对话上下文。
-//
-// 返回:
-//   - *types.AgentState: 包含完整执行轨迹、知识引用和最终状态的指针。
-//   - error: 执行过程中遇到的任何错误，若成功则为 nil。
+// AgentEngine.Execute
+//	│
+//	├── 1. 记录执行开始日志
+//	│      → 打印 sessionID / messageID / query / llmContext 数量
+//	│      → 上报 execute_start 埋点
+//	│
+//	├── 2. defer: 清理工具资源
+//	│      → 执行结束后调用 e.toolRegistry.Cleanup(ctx)
+//	│      → 释放本轮 Agent 运行过程中注册/持有的工具资源
+//	│
+//	├── 3. 初始化 AgentState
+//	│      → 创建本轮执行状态 state
+//	│      → 包含：
+//	│          - RoundSteps
+//	│          - KnowledgeRefs
+//	│          - IsComplete
+//	│          - CurrentRound
+//	│
+//	├── 4. 构建 systemPrompt
+//	│      → 如果启用了 Skills
+//	│           用 BuildSystemPromptWithOptions() 构建系统提示词
+//	│           并注入技能元信息
+//	│      → 否则使用 BuildSystemPrompt()
+//	│      → systemPrompt 决定本轮 Agent 的角色、规则、知识库说明、工具使用约束
+//	│
+//	├── 5. 构建发给 LLM 的 messages
+//	│      → 调 buildMessagesWithLLMContext(systemPrompt, query, llmContext)
+//	│      → 拼出完整消息序列：
+//	│          1) system prompt
+//	│          2) 历史消息 llmContext
+//	│          3) 当前用户 query
+//	│
+//	├── 6. 构建 tools 定义
+//	│      → 调 buildToolsForLLM()
+//	│      → 生成给 LLM 的 function calling / tools 列表
+//	│      → 同时记录启用了哪些工具
+//	│      → 上报 tools_ready 埋点
+//	│
+//	├── 7. 进入 executeLoop()
+//	│      → 调 e.executeLoop(ctx, state, query, messages, tools, sessionID, messageID)
+//	│      → 这是 Agent 真正运行的核心循环
+//	│      → 会执行 ReAct / Tool Calling 过程：
+//	│          - 思考
+//	│          - 判断是否调用工具
+//	│          - 执行工具
+//	│          - 读取工具结果
+//	│          - 继续下一轮推理
+//	│          - 最终产出 final answer
+//	│
+//	├── 8. executeLoop 失败时
+//	│      → 记录错误日志
+//	│      → emit EventError 到 eventBus
+//	│      → 把错误作为流式事件交给上层处理
+//	│      → 返回 nil, err
+//	│
+//	├── 9. executeLoop 成功时
+//	│      → 说明本轮 Agent 执行完成
+//	│      → 记录完成日志：rounds / steps / complete
+//	│      → 上报 execute_complete 埋点
+//	│
+//	└── 10. 返回 state
+//		  → 返回本轮 Agent 最终状态
+//		  → 包含执行过程中累计的步骤、引用、完成状态等
 
 // Execute executes the agent with conversation history and streaming output
 // All events are emitted to EventBus and handled by subscribers (like Handler layer)
@@ -281,6 +293,8 @@ func (e *AgentEngine) Execute(
 	return state, nil
 }
 
+// [重要]
+//
 // 核心流程
 //
 //	函数 executeLoop 采用了一个 for 循环，直到达到最大迭代次数（MaxIterations）或 LLM 给出最终答复。
@@ -316,6 +330,138 @@ func (e *AgentEngine) Execute(
 // 返回:
 // - *types.AgentState: 执行结束后的完整状态（含最终答案与执行轨迹）。
 // - error: 若发生不可恢复错误（如 LLM 服务不可用）则返回错误，工具级错误由内部消化处理。
+
+// executeLoop
+//	│
+//	├── 1. 记录 loop_start
+//	│      → 记录开始时间 startTime
+//	│      → 上报 loop_start 埋点
+//	│      → 准备进入 ReAct 主循环
+//	│
+//	├── 2. for state.CurrentRound < MaxIterations
+//	│      → 每次循环代表 Agent 的一轮 ReAct 迭代
+//	│      → 一轮大致包含：Think -> Check -> Act -> Observe
+//	│
+//	├── 3. Round Start
+//	│      → 记录当前 roundStart
+//	│      → 打印当前轮次、消息数、工具数
+//	│      → 上报 round_start 埋点
+//	│
+//	├── 4. Think：调用 LLM 做本轮推理
+//	│      → 调 streamThinkingToEventBus(ctx, messages, tools, iteration, sessionID)
+//	│      → 让模型基于当前上下文决定：
+//	│           - 直接回答
+//	│           - 还是继续调用工具
+//	│      → 过程中会通过 eventBus 流式发事件：
+//	│           - thought
+//	│           - tool_call（pending 提示）
+//	│
+//	├── 5. Think 失败处理
+//	│      → 如果 LLM 调用失败
+//	│      → 记录错误日志 / 埋点
+//	│      → 直接返回 error，终止整个 Agent 执行
+//	│
+//	├── 6. 解析本轮 LLM 响应
+//	│      → 得到 response：
+//	│           - FinishReason
+//	│           - Content（本轮思考/回答文本）
+//	│           - ToolCalls（本轮决定调用的工具）
+//	│      → 同时创建 step，记录本轮 Thought / ToolCalls / Timestamp
+//	│
+//	├── 7. Check：判断是否已经可以结束
+//	│      → 条件：response.FinishReason == "stop" && len(response.ToolCalls) == 0
+//	│      → 表示模型认为：
+//	│           - 不需要继续调用工具
+//	│           - 当前内容就是最终答案
+//	│      → 这时：
+//	│           - state.FinalAnswer = response.Content
+//	│           - state.IsComplete = true
+//	│           - state.RoundSteps append step
+//	│           - emit EventAgentFinalAnswer(done=true)
+//	│           - break 跳出主循环
+//	│
+//	├── 8. Act：如果有 ToolCalls，就逐个执行工具
+//	│      → 遍历 response.ToolCalls
+//	│      → 每个工具调用都走完整的“解析参数 -> 执行 -> 发事件 -> 写回 step”流程
+//	│
+//	├── 9. Tool 参数解析
+//	│      → 将 tc.Function.Arguments 反序列化成 args
+//	│      → 如果参数 JSON 非法，就跳过该工具调用
+//	│
+//	├── 10. emit EventAgentToolCall
+//	│       → 正式发出 tool_call 事件
+//	│       → 包含：ToolCallID / ToolName / Arguments / Iteration
+//	│       → 告诉前端：这个工具现在真的要执行了
+//	│
+//	├── 11. 执行工具
+//	│       → 调 e.toolRegistry.ExecuteTool(ctx, toolName, rawArgs)
+//	│       → 记录耗时 duration
+//	│       → 把结果封装成 toolCall 对象
+//	│
+//	├── 12. 工具失败容错
+//	│       → 即使工具执行报错，也不会让整个 Agent 直接崩掉
+//	│       → 会把错误包装进 ToolResult
+//	│       → 让后续 LLM 把“工具失败”也当成 observation 继续推理
+//	│
+//	├── 13. emit EventAgentToolResult
+//	│       → 发出工具执行结果事件
+//	│       → 包含：
+//	│           - ToolCallID
+//	│           - ToolName
+//	│           - Output
+//	│           - Error
+//	│           - Success
+//	│           - Duration
+//	│           - Data（结构化结果）
+//	│
+//	├── 14. emit EventAgentTool
+//	│       → 发内部监控用事件
+//	│       → 用于记录工具执行动作，不是主要前端展示链路
+//	│
+//	├── 15. 可选 Reflection
+//	│       → 如果 ReflectionEnabled && result != nil
+//	│      → 调 streamReflectionToEventBus(...)
+//	│      → 让模型针对本次工具结果做一次“反思”
+//	│      → 过程中 emit EventAgentReflection
+//	│      → 返回的 reflection 会挂到 step.ToolCalls[last].Reflection
+//	│
+//	├── 16. 本轮 step 收尾
+//	│       → state.RoundSteps append step
+//	│       → 这一轮的 thought / toolcalls / reflection 都被记录进 state
+//	│
+//	├── 17. Observe：把本轮结果写回 messages
+//	│       → 调 appendToolResults(ctx, messages, step)
+//	│      → 追加两类消息到对话历史：
+//	│           1) assistant 消息：包含本轮 thought + tool_calls
+//	│           2) tool 消息：包含每个工具的执行结果
+//	│      → 同时写入 contextManager，供下一轮继续使用
+//	│
+//	├── 18. Round End
+//	│       → 上报 round_end 埋点
+//	│       → state.CurrentRound++
+//	│       → 进入下一轮循环
+//	│
+//	├── 19. MaxIterations 兜底
+//	│       → 如果循环跑满了还没得到最终答案
+//	│      → 调 streamFinalAnswerToEventBus(ctx, query, state, sessionID)
+//	│      → 强制基于已有结果合成最终答案
+//	│      → 如果合成失败，则给一个兜底抱歉文案
+//	│      → 最后 state.IsComplete = true
+//	│
+//	├── 20. emit EventAgentComplete
+//	│       → 无论是正常结束还是兜底结束
+//	│      → 最终都会发 complete 事件
+//	│      → 包含：
+//	│           - FinalAnswer
+//	│           - KnowledgeRefs
+//	│           - AgentSteps
+//	│           - TotalSteps
+//	│           - TotalDurationMs
+//	│           - MessageID
+//	│
+//	└── 21. 返回 state
+//		  → 返回完整的 AgentState
+//		  → 包含最终答案、执行步骤、引用、完成状态等
 
 // executeLoop executes the main ReAct loop
 // All events are emitted through EventBus with the given sessionID
@@ -951,6 +1097,87 @@ func (e *AgentEngine) streamReflectionToEventBus(
 
 	return fullReflection, nil
 }
+
+// streamThinkingToEventBus
+//	│
+//	├── 1. 记录本轮 Think 开始
+//	│      → 打印 iteration / temperature / tools 数量 / thinking 开关
+//	│      → 说明这一轮即将开始调用 LLM 做“思考/决策”
+//	│
+//	├── 2. 构造 ChatOptions
+//	│      → opts.Temperature = e.config.Temperature
+//	│      → opts.Tools = tools
+//	│      → opts.Thinking = e.config.Thinking
+//	│      → 这些参数决定本轮 LLM 如何输出思考内容和工具调用
+//	│
+//	├── 3. 初始化 pendingToolCalls
+//	│      → 创建 map[string]bool
+//	│      → 用来给“流式识别出的 tool_call”做防重
+//	│      → 避免同一个 tool_call 在多个 chunk 中重复触发 pending 事件
+//	│
+//	├── 4. 生成 thinkingID
+//	│      → 这一整轮 thinking stream 共享同一个 thinkingID
+//	│      → 这样前端可以把多个 thought chunk 视为同一条流式文本并拼接渲染
+//	│
+//	├── 5. 调用 streamLLMToEventBus()
+//	│      → 这是底层真正去拉 LLM 流的通用函数
+//	│      → 输入：messages + opts
+//	│      → 输出：
+//	│           - fullContent：完整拼接后的思考文本
+//	│           - toolCalls：完整收集后的工具调用列表
+//	│      → 并通过 callback 对每个 chunk 做即时处理
+//	│
+//	├── 6. callback：遇到 tool_call chunk 时
+//	│      → 条件：chunk.ResponseType == ResponseTypeToolCall && chunk.Data != nil
+//	│      → 从 chunk.Data 取：
+//	│           - tool_call_id
+//	│           - tool_name
+//	│      → 如果：
+//	│           - toolCallID 不为空
+//	│           - toolName 不为空
+//	│           - 这个 toolCallID 还没发过 pending 事件
+//	│      → 则：
+//	│           - pendingToolCalls[toolCallID] = true
+//	│           - emit EventAgentToolCall（pending 版）
+//	│      → 作用：前端能立刻看到“准备调用某个工具”
+//	│      → 注意：这里还不是工具真正执行，只是提前感知工具意图
+//	│
+//	├── 7. callback：遇到文本 content chunk 时
+//	│      → 条件：chunk.Content != ""
+//	│      → emit EventAgentThought
+//	│      → 事件内容包括：
+//	│           - Content = chunk.Content
+//	│           - Iteration = 当前轮次
+//	│           - Done = chunk.Done
+//	│      → 所有 thought chunk 共用同一个 thinkingID
+//	│      → 这样前端可以把它们拼成一段连续的“思考流”
+//	│
+//	├── 8. streamLLMToEventBus 内部做的事
+//	│      → 逐个读取 LLM 返回的 chunk
+//	│      → 将 chunk.Content 累加成 fullContent
+//	│      → 将 chunk.ToolCalls 持续更新成最新的完整 toolCalls
+//	│      → 每来一个 chunk 就调用 callback
+//	│      → 所以这里实现的是：
+//	│           “边接收 LLM 流，边发业务事件，边做最终结果聚合”
+//	│
+//	├── 9. 如果流式调用失败
+//	│      → 记录 thinking stream failed
+//	│      → 直接 return nil, err
+//	│      → 上层 executeLoop 会统一处理这个错误
+//	│
+//	├── 10. 如果流式调用成功
+//	│       → fullContent 里是这一轮完整思考文本
+//	│       → toolCalls 里是这一轮最终解析出的完整工具调用列表
+//	│       → 记录 thinking completed 日志
+//	│
+//	└── 11. 返回 ChatResponse
+//		  → 返回：
+//		      - Content = fullContent
+//		      - ToolCalls = toolCalls
+//		      - FinishReason = "stop"
+//		  → 上层 executeLoop 再根据这个结果判断：
+//		      - 直接结束
+//		      - 还是进入工具执行阶段
 
 // streamThinkingToEventBus 调用 LLM 执行推理阶段，并将思考过程与工具调用决策实时流式推送至事件总线。
 // 该函数是 ReAct 循环中 "Think" 环节的核心实现，负责连接底层 LLM 流式接口与上层事件驱动架构。

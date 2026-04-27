@@ -533,6 +533,43 @@ func (c *RemoteAPIChat) processStreamDelta(ctx context.Context, choice *openai.C
 	}
 }
 
+// 在底层 LLM 流里，tool call 很可能会跨多个 chunk，需要拼接。
+//
+// 例如：
+// 	chunk1: tool name = "web_"
+//	chunk2: tool name = "search"
+//	chunk3: arguments = "{ \"q\": \"R"
+//	chunk4: arguments = "AG 是什么\" }"
+//
+// 这里会把这些片段拼起来，最后得到完整的：
+//	{
+//	 	"tool_name": "web_search",
+//	 	"arguments": { "q": "RAG 是什么" }
+//	}
+//
+// 至于业务层，发给事件总线的 EventAgentToolCall 一般不是每个底层 chunk 都发一次，
+// 当前实现里有两种时机：
+//
+//  - Pending 通知
+//	流里一旦识别出“模型准备调用某个工具了”，就会先发一个简化版 EventAgentToolCall：
+//	只有 tool_call_id、tool_name，没有完整参数，这是为了让前端早点显示“正在调用某工具”。
+//
+//	- 正式 tool call 事件
+//	等工具调用信息完整后，才发真正的 EventAgentToolCall，里面会带：tool_call_id、tool_name、arguments。
+//
+// 举例：
+//	LLM 流输出：
+//	 "我需要查..."  → EventAgentThought
+//	 "天气，参数..." → tool_call chunk (pending)
+//	 "是北京..."    → tool_call chunk (pending)
+//	 "的天气}"      → tool_call chunk (done)
+//
+//	前端收到第一个 pending 事件时：
+//	 "准备调用 get_weather..."  ← 用户立刻感知到要调工具了
+//
+//	工具信息完整后，第二次 emit 时：
+//	 "调用 get_weather，参数: {city: 北京}"  ← 参数完整了
+
 // processToolCallsDelta 处理 tool calls 的增量更新
 func (c *RemoteAPIChat) processToolCallsDelta(toolCalls []openai.ToolCall, state *streamState, streamChan chan types.StreamResponse) {
 	for _, tc := range toolCalls {

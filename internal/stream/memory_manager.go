@@ -15,6 +15,9 @@ type memoryStreamData struct {
 	mu          sync.RWMutex
 }
 
+// MemoryStreamManager 基于内存实现的流事件管理器
+// 采用两级映射：sessionID -> messageID -> 流数据
+
 // MemoryStreamManager implements StreamManager using in-memory storage
 type MemoryStreamManager struct {
 	// Map: sessionID -> messageID -> stream data
@@ -59,6 +62,14 @@ func (m *MemoryStreamManager) getStream(sessionID, messageID string) *memoryStre
 	return nil
 }
 
+// AppendEvent 向指定会话和消息的流中追加一个事件
+//
+// 参数：
+//   ctx - 上下文（当前未使用）
+//   sessionID - 会话ID
+//   messageID - 消息ID
+//   event - 待追加的流事件（若其 Timestamp 为空则自动设为当前时间）
+
 // AppendEvent appends a single event to the stream
 func (m *MemoryStreamManager) AppendEvent(
 	ctx context.Context,
@@ -81,6 +92,19 @@ func (m *MemoryStreamManager) AppendEvent(
 
 	return nil
 }
+
+// GetEvents 从指定偏移量开始获取流事件列表
+//
+// 参数：
+//   ctx - 上下文（当前未使用）
+//   sessionID - 会话ID
+//   messageID - 消息ID
+//   fromOffset - 起始偏移量（从0开始）
+//
+// 返回：
+//   events - 从偏移量开始到结尾的事件切片（拷贝副本，避免竞态）
+//   nextOffset - 下一次请求的起始偏移量（当前事件总数）
+//   error - 可能出现的错误（当前实现始终返回 nil）
 
 // GetEvents gets events starting from offset
 // Returns: events slice, next offset, error

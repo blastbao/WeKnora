@@ -203,19 +203,61 @@ func (h *Handler) createAssistantMessage(ctx context.Context, assistantMessage *
 	return h.messageService.CreateMessage(ctx, assistantMessage)
 }
 
-// setupStreamHandler 创建并订阅 Agent 流式事件处理器。
+// [重要]
 //
-// 执行过程：
-//  1. 创建 AgentStreamHandler 实例
-//  2. 调用 Subscribe 订阅所有事件
+// StreamManager 是 SSE 事件的缓冲区 ，底层用 Redis/Memory 存储。
+// 它负责把一轮回答过程中产生的所有 SSE 事件暂存起来，供当前连接持续读取，也供断线后继续续流。
 //
-// 参数:
-//   - ctx: 请求上下文。
-//   - sessionID: 会话 ID。
-//   - assistantMessageID: 助手消息 ID。
-//   - requestID: 请求 ID。
-//   - assistantMessage: 助手消息对象（用于状态更新）。
-//   - eventBus: 事件总线。
+// Q. 为什么需要这个缓冲区？
+//  1. 解耦生产者和消费者，后台生成事件不用直接操作 SSE 连接。
+//		不用缓冲区：
+//			AgentStreamHandler ──直接──► SSE 连接
+//			（必须同步，必须知道 SSE 在哪）
+//		用了缓冲区：
+//			AgentStreamHandler ──► Redis ──► handleAgentEventsForSSE ──► SSE
+//			（异步，各干各的）
+//  2. 支持断线重连（ContinueStream）
+//		前端断线后重新连接，ContinueStream 可以按 sessionID + messageID + offset ，
+//		重新把历史事件取出来继续发，而不用重新执行整个问答。
+//
+//
+// 具体来讲，有了 StreamManager 之后：
+// 	- KnowledgeQA / AgentQA 产生日志式事件
+// 	- AgentStreamHandler 把事件写进 streamManager
+// 	- handleAgentEventsForSSE 再从 streamManager 轮询取出，推给前端
+//
+// 它和 EventBus 不同，EventBus 负责组件间通知，StreamManager 负责前端拉取。
+// EventBus 是内部广播，StreamManager 是对外输出。
+//
+// 二者配合使用：
+//
+//	AgentEngine emit(EventAgentThought)
+//		   │
+//		   ▼
+//	EventBus 广播
+//		   │
+//		   ▼
+//	AgentStreamHandler.On(...) 收到
+//		   │
+//		   ▼
+//	AppendEvent() 写入
+//		   │
+//		   ▼
+//	StreamManager (Redis)
+//		   │
+//		   ▼
+//	handleAgentEventsForSSE.GetEvents() 轮询拉取
+//		   │
+//		   ▼
+//	SSEvent() 推给前端
+
+// AgentStreamHandler 是“事件搬运和转换中心”：
+//
+// 交互流程：
+//	上游是 KnowledgeQA / AgentQA 过程中不断发出的各种事件
+//	它通过 Subscribe() 订阅这些事件
+//	然后把事件写进 streamManager
+//	下游 handleAgentEventsForSSE 再从 streamManager 拉取事件，真正通过 SSE 推给前端
 
 // setupStreamHandler creates and subscribes a stream handler
 func (h *Handler) setupStreamHandler(
@@ -238,8 +280,6 @@ func (h *Handler) setupStreamHandler(
 }
 
 // setupStopEventHandler 注册停止事件处理器
-//
-//
 //
 // 执行过程：
 //  1. 在 eventBus 上订阅 EventStop 事件。

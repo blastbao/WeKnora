@@ -8,6 +8,53 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// GenerateTitle
+//	│
+//	├── 1. 获取请求上下文 ctx
+//	│      → 从 c.Request.Context() 取出上下文
+//	│      → 用于日志、租户信息、后续 service 调用
+//	│
+//	├── 2. 记录“开始生成标题”日志
+//	│      → 标记本次接口调用开始
+//	│
+//	├── 3. 读取 session_id
+//	│      → 从 URL path 参数中取 session_id
+//	│      → 如果为空，直接返回 BadRequest
+//	│
+//	├── 4. 解析请求体
+//	│      → 反序列化 GenerateTitleRequest
+//	│      → 其中通常包含 messages
+//	│      → 如果 JSON 非法，直接返回 BadRequest
+//	│
+//	├── 5. 查询 session
+//	│      → 调 h.sessionService.GetSession(ctx, sessionID)
+//	│      → 确认这个会话存在，并拿到完整 session 对象
+//	│      → 如果查询失败，返回 InternalServerError
+//	│
+//	├── 6. 调用 sessionService.GenerateTitle()
+//	│      → 输入：
+//	│           - ctx
+//	│           - session
+//	│           - request.Messages
+//	│           - modelID=""（表示不手动指定模型，由 service 自己决定）
+//	│      → 根据会话消息内容生成标题
+//	│
+//	├── 7. 处理生成失败
+//	│      → 如果 GenerateTitle 返回 error
+//	│      → 记录错误日志
+//	│      → 返回 InternalServerError
+//	│
+//	├── 8. 处理生成成功
+//	│      → 得到 title
+//	│      → 记录“标题生成成功”日志
+//	│
+//	└── 9. 返回 HTTP JSON 响应
+//		  → c.JSON(200, {
+//		        "success": true,
+//		        "data": title,
+//		    })
+//		  → 把生成好的标题直接返回给前端
+
 // GenerateTitle godoc
 // @Summary      生成会话标题
 // @Description  根据消息内容自动生成会话标题

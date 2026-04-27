@@ -128,6 +128,52 @@ func (p *MemoryPlugin) OnEvent(
 //	AI 的反应：
 //		“根据之前的记录，你上次（2026年2月10日）提到的书是《三体》。”
 
+// handleRetrieval
+//	│
+//	├── 1. 检查是否启用 memory
+//	│      → 如果 chatManage.EnableMemory == false
+//	│      → 直接跳过，不做长期记忆检索
+//	│      → return next()
+//	│
+//	├── 2. 记录“开始检索记忆”日志
+//	│      → 标记进入长期记忆读取流程
+//	│
+//	├── 3. 选择检索 query
+//	│      → 优先使用 chatManage.RewriteQuery
+//	│      → 如果没有改写后的 query
+//	│      → 则回退到 chatManage.Query
+//	│      → 目的是让记忆检索更贴近语义后的问题表达
+//	│
+//	├── 4. 调用 memoryService.RetrieveMemory()
+//	│      → 输入：userID + query
+//	│      → 内部流程通常是：
+//	│           - 先让模型提关键词
+//	│           - 再去 MemoryRepository 查相关 episodes
+//	│      → 返回 MemoryContext
+//	│
+//	├── 5. 检索失败时容错
+//	│      → 如果 RetrieveMemory 出错
+//	│      → 只记日志，不中断主问答链路
+//	│      → return next()
+//	│      → memory 只是增强项，不应阻塞回答
+//	│
+//	├── 6. 如果检索到了相关记忆
+//	│      → 遍历 memoryContext.RelatedEpisodes
+//	│      → 构造一段 Prompt 文本：
+//	│           Relevant Memory:
+//	│           - 日期 (Summary: ...)
+//	│
+//	├── 7. 注入到 chatManage.UserContent
+//	│      → 将 Relevant Memory 追加到用户输入末尾
+//	│      → 这样后续发给模型的 prompt 就带上了长期记忆背景
+//	│
+//	├── 8. 记录“记忆检索完成”日志
+//	│      → 标记 retrieval 流程结束
+//	│
+//	└── 9. 继续主流水线
+//		  → return next()
+//		  → 后续插件 / 问答流程继续执行
+
 func (p *MemoryPlugin) handleRetrieval(
 	ctx context.Context,
 	chatManage *types.ChatManage,
@@ -179,6 +225,60 @@ func (p *MemoryPlugin) handleRetrieval(
 //		动作：插件变身为“监听者”，订阅 EventAgentFinalAnswer 事件。
 //		过程：每蹦出一个词，就把词累加到 fullResponse 变量里，过程中盯着那个 data.Done 标志位。
 //		收网：一旦 Done 为 true，说明话讲完了。这时候才启动协程，把攒好的 fullResponse 存进记忆库。
+
+// handleStorage
+//	│
+//	├── 1. 先执行下游主流程
+//	│      → 调 next()
+//	│      → 让真正的回答先跑完
+//	│      → 如果下游报错，直接返回错误，不做记忆存储
+//	│
+//	├── 2. 检查是否启用 memory
+//	│      → 如果 chatManage.EnableMemory == false
+//	│      → 直接返回，不做长期记忆写入
+//	│
+//	├── 3. 记录“开始存储记忆”日志
+//	│      → 标记进入长期记忆写入流程
+//	│
+//	├── 4. 判断回答是非流式还是流式
+//	│      → 分成两条路径：
+//	│           A. ChatResponse 已经完整可用（非流式）
+//	│           B. 需要监听 EventAgentFinalAnswer（流式）
+//	│
+//	├── 5A. 非流式路径：如果 chatManage.ChatResponse != nil
+//	│      → 直接组装 messages：
+//	│           - user: chatManage.Query
+//	│           - assistant: chatManage.ChatResponse.Content
+//	│      → 然后异步 go func() 调 memoryService.AddEpisode()
+//	│      → 目的是后台存储，不阻塞用户响应
+//	│      → return nil
+//	│
+//	├── 5B. 流式路径：如果 chatManage.EventBus != nil
+//	│      → 注册 EventAgentFinalAnswer 监听器
+//	│      → 准备一个 fullResponse 字符串用于累加
+//	│
+//	├── 6B. 监听流式 final_answer chunk
+//	│      → 每次收到 EventAgentFinalAnswer
+//	│      → fullResponse += data.Content
+//	│      → 不断把 assistant 正文 chunk 累积起来
+//	│
+//	├── 7B. 检测 data.Done
+//	│      → 当 data.Done == true
+//	│      → 说明这轮 assistant 的最终回答已经完整生成
+//	│      → 此时组装 messages：
+//	│           - user: chatManage.Query
+//	│           - assistant: fullResponse
+//	│
+//	├── 8B. 异步写入 memory
+//	│      → go func() 调 memoryService.AddEpisode()
+//	│      → 把本轮问答沉淀成长期记忆
+//	│      → 不阻塞流式收尾
+//	│
+//	├── 9. 记录“结束存储记忆”日志
+//	│      → 标记 storage 流程主体结束
+//	│
+//	└── 10. 返回 nil
+//		  → memory 写入是增强功能，走异步后台执行
 
 func (p *MemoryPlugin) handleStorage(
 	ctx context.Context,
